@@ -10,12 +10,7 @@ from glob import glob
 from craft import sigproc
 from craft import uvfits
 
-from create_injection_params_file import total_burst_length
-
-def save_code():
-    df =pd.DataFrame(inject_params['furby_props'])
-    new_columns = {col:col+'_inj' for col in df.columns}
-    df.rename(columns=new_columns)
+from .create_injection_params_file import total_burst_length
 
 
 class InjectionResults:
@@ -164,7 +159,7 @@ def path_if_exists(path):
 
 
 def get_dm_pccc(freqs, dm_samps, tsamp):
-    '''Storlen from
+    '''Stolen from
     freqs in Hz
     tsamp in s
     '''

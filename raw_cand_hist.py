@@ -11,7 +11,7 @@ from glob import glob
 from craft import sigproc
 from craco.datadirs import format_sbid
 
-from check_injections import InjectionResults
+from .check_injections import InjectionResults
 
 
 def get_raws_from_sbrange(sb_start, sb_end=None, exclude_single_events=False, get_raws=True):
