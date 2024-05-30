@@ -2,7 +2,6 @@ import os
 import warnings
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import yaml
 
 from glob import glob
@@ -16,12 +15,12 @@ from .create_injection_params_file import total_burst_length
 class InjectionResults:
     """Make all the path handling easier by saving them in a class"""
 
-    def __init__(self, obs_id, beam='00', run='inj', scan='00', scantime='??????????????',
+    def __init__(self, sbid, beam='00', run='inj', scan='00', scantime='??????????????',
                  clustering_dir='clustering_output', tsamp=0.013824):
         """Define all the paths
 
         Parameters:
-            obs_id (str): Observation ID, e.g. 'SB058479'.
+            sbid (str): Observation ID, e.g. 'SB058479'.
             beam (str or int): Beam number
             run (str): The name of the run directory, e.g. 'results'.
             scan (str): Name of scan directory.
@@ -30,12 +29,12 @@ class InjectionResults:
             tsamp (float): Sampling time (s). This is not in the logs.
         """
         # Allow for the five digit SB number only.
-        if len(str(obs_id)) == 5:
-            obs_id = 'SB0' + str(obs_id)
+        if len(str(sbid)) == 5:
+            sbid = 'SB0' + str(sbid)
 
         # Make beam possible as int and str.
-        if isinstance(beam, int):
-            self.beam_int = beam
+        if isinstance(beam, np.integer):
+            self.beam_int = int(beam)
             beam = str(beam)
         else:
             self.beam_int = int(beam)
@@ -44,14 +43,18 @@ class InjectionResults:
 
         # Define Data locations to be searched.
         obs_path_pattern = '/CRACO/DATA_??/craco/'
-        inj_pattern = os.path.join(obs_path_pattern, obs_id, 'scans/', scan, scantime, run, f'search_pipeline_b{beam}.log')
+        inj_pattern = os.path.join(obs_path_pattern, sbid, 'scans/', scan, scantime, run, f'search_pipeline_b{beam}.log')
         log_paths = glob(inj_pattern)
-        if len(log_paths) > 1:
+        if len(log_paths) == 0:
+            raise ValueError(f"No logfile found at {inj_pattern}.")
+        elif len(log_paths) > 1:
             warnings.warn(f"{len(log_paths)} directories matching the pattern have been found. Continuing with {log_paths[0]}")
         inj_path = os.path.dirname(log_paths[0])
 
         # Get all the useful paths
+        self.sbid = sbid
         self.beam = beam
+        self.tsamp = tsamp
         self.run_path = inj_path
         self.log_path = log_paths[0]
         clustering_path = os.path.join(inj_path, clustering_dir)
@@ -65,13 +68,12 @@ class InjectionResults:
         self.alias_path = path_if_exists(os.path.join(clustering_path, f'candidates.b{beam}.txt.alias_filter.i2.csv'))
         self.pcb_path = path_if_exists(os.path.join(inj_path, f'pcb{beam}.fil'))
         self.uvfits_path = path_if_exists(os.path.join(os.path.dirname(inj_path), f'b{beam}.uvfits'))
-        self.yaml_path = path_if_exists(self.get_yaml_path())
 
-        # Calculate maximum searched DM.
+    def calculate_dm_pccm3(self):
+        """Calculate maximum searched DM."""
         fmin = self.fmin
         fmax = fmin + self.foff*self.nchan
-        self.dm_pccc = get_dm_pccc([fmin, fmax], self.ndm, tsamp)
-
+        self.dm_pccm3 = get_dm_pccm3([fmin, fmax], self.ndm, self.tsamp)
 
     def compare_uvfits_fil_lengths(self):
         """Check duration length in uvfits file and compare agains the filterbank file."""
@@ -142,11 +144,17 @@ class InjectionResults:
 
     def do_all_checks(self):
         """Execute all functions."""
-        self.compare_uvfits_fil_lengths()
+        # self.compare_uvfits_fil_lengths()
+        # test_id_presence(self)
+        self.yaml_path = path_if_exists(self.get_yaml_path())
         log_injs = self.count_log_injections()
         injs = check_candpipe_files(self.orig_inj_path, self.found_inj_path, self, num_injs=log_injs)
-        injs[~injs['missed']] = count_found_clusters(found_injs=injs[~injs['missed']], raw_cand_file=self.raw_cand_file)
-        #injs = add_yaml_parameters(injs, "/CRACO/DATA_00/craco/injection/inj_params7_pc_width.yml") #self.yaml_path)
+        test_closest_inj(injs)
+        # if not 'n_clusters' in injs.columns:
+        #     # Initialize column, else it will be discarded.
+        #     injs['n_clusters'] = pd.Series(dtype='int')
+        # injs[~injs['missed']] = count_found_clusters(found_injs=injs[~injs['missed']], raw_cand_file=self.raw_cand_file)  #slow af
+        # injs = add_yaml_parameters(injs, self.yaml_path)  #"/CRACO/DATA_00/craco/injection/inj_params7_pc_width.yml") #
         injs = check_masked_channels(injs, filpath=self.pcb_path)
 
         return injs
@@ -158,7 +166,7 @@ def path_if_exists(path):
     return path
 
 
-def get_dm_pccc(freqs, dm_samps, tsamp):
+def get_dm_pccm3(freqs, dm_samps, tsamp):
     '''Stolen from
     freqs in Hz
     tsamp in s
@@ -181,68 +189,95 @@ def check_candpipe_files(orig_file, found_file, obsi, print_missed=False, num_in
         # orig_injs = orig_injs.loc[:num_injs]  # Feel like this is unsave (sometimes an injection gets picked up several times).
 
     found_injs = pd.read_csv(found_file)
-    found_injs = found_injs[~found_injs['SNR'].isna()]  # Not needed depending on the day. Yuanming seems to be changing the pipeline output on a weekly basis.
-
+    found_injs = found_injs[~found_injs['SNR'].isna()]  # Not needed depending on the day.
+    # Yuanming seems to be changing the pipeline output on a weekly basis.
     # found_injs = found_injs[found_injs['INJ_name'].isin(orig_injs['name'])]  Was workaround with line above
 
     # Crosscheck the time to make sure which injection was found. (Don't trust pipeline)
-    closest_inj = np.argmin(np.abs(found_injs['total_sample'].to_numpy()[:, None]-orig_injs['total_sample'].to_numpy()), axis=1)
-    found_injs['INJ_closest'] = orig_injs['name'].iloc[closest_inj].to_numpy()
+    closest_inj = np.argmin(np.abs(found_injs['total_sample'].to_numpy()[:, None]
+                                   -orig_injs['total_sample_inj'].to_numpy()),
+                            axis=1)
+    found_injs['INJ_closest'] = orig_injs['INJ_name'].to_numpy()[closest_inj]
 
-    missed = ~ orig_injs['name'].isin(found_injs['INJ_closest'])
-    missed_injs = orig_injs[missed]
+    missed = ~ orig_injs['INJ_name'].isin(found_injs['INJ_name'])
+    missed_injs = orig_injs[missed].copy()
     # Print a useful message.
     if not missed_injs.empty and print_missed:
-        print(f"================ {obs_id}  Beam {obsi.beam_int} ================")
+        print(f"================ {sbid}  Beam {obsi.beam_int} ================")
         print("Missed:")
         print(missed_injs)
 
     # Summarize useful data from all injections for plotting etc.
-    missed_injs = missed_injs.rename(columns={'name':'INJ_name', 'total_sample':'total_sample_inj',
-                                              'dm_pccm3':'dm_pccm3_inj'})
+    # missed_injs = missed_injs.rename(columns={'name':'INJ_name', 'total_sample':'total_sample_inj',
+    #                                           'dm_pccm3':'dm_pccm3_inj'})
     missed_injs['missed'] = True
     found_injs['missed'] = False
 
-    # Get the number of clusters in the raw candidates.
-    raw_cands = pd.read_csv(obsi.raw_cand_file, index_col=0)
-    injs = found_injs  # in case of no missed injections.
+    # Search uniq, rfi, and raw candidates for missed ones and save their properties. Exclude the raws that were found.
+    if not missed_injs.empty:
+        uniq_cands = pd.read_csv(obsi.uniq_path, index_col=0)
+        rfi_cands = pd.read_csv(obsi.rfi_path, index_col=0)
+    raw_loaded = False
+    noninj_cands = []
 
-    # Search raw candidates for missed ones and save their properties.
     for mj in missed_injs.index:
         missed_inj = missed_injs.loc[mj]
+        close_uniqs = find_close_cands(uniq_cands, missed_inj)
+        if not close_uniqs.empty:
+            noninj_cands.append(add_missed_cols_etc(close_uniqs, missed_inj, found_in='uniq'))
 
-        close_raws = find_close_cands(raw_cands, missed_inj)
-        if close_raws.empty:
-            if print_missed:
-                print("No raw candidades.")
-            injs.loc[mj] = missed_inj
+        close_rfis = find_close_cands(rfi_cands, missed_injs.loc[mj])
+        if not close_rfis.empty:
+            noninj_cands.append(add_missed_cols_etc(close_rfis, missed_inj, found_in='rfi'))
+
+        if close_uniqs.empty and close_rfis.empty:
+            if not raw_loaded:
+                raw_cands = pd.read_csv(obsi.raw_cand_file, index_col=0)
+                raw_cands = raw_cands[~raw_cands['cluster_id'].isin(found_injs['cluster_id'])]
+            close_raws = find_close_cands(raw_cands, missed_injs.loc[mj])
+            if not close_raws.empty:
+                max_snr = close_raws['SNR'].idxmax()
+                missed_injs.loc[mj, close_raws.columns] = close_raws.loc[max_snr]
+                missed_injs.loc[mj, 'n_clusters'] = len(close_raws['cluster_id'].unique())
+                missed_injs.loc[mj, 'found_in'] = 'raw'
+                missed_injs.loc[mj, 'classification'] = obsi.search_classification(close_raws.loc[max_snr, 'cluster_id'])
+                # Indexing with lists avoids conversion to Series. But doesn't work because index is different.
         else:
-            if print_missed:
-                print("Raw candidates:")
-                print(close_raws)
-            max_snr = close_raws['SNR'].idxmax()
-            injs.loc[mj, close_raws.columns] = close_raws.loc[max_snr]  # Indexing with lists avoids conversion to Series. But doesn't work because index is different.
-            injs.loc[mj, ['INJ_name', 'total_sample_inj', 'dm_pccm3_inj', 'snr', 'missed']] = missed_inj[['INJ_name', 'total_sample_inj', 'dm_pccm3_inj', 'snr', 'missed']]
-            injs.loc[mj, 'n_clusters'] = len(close_raws['cluster_id'].unique())
-            injs.loc[mj, 'classification'] = obsi.search_classification(close_raws.loc[max_snr, 'cluster_id'])
+            missed_injs = missed_injs.drop(index=mj)
 
+    injs = pd.concat([found_injs, missed_injs, *noninj_cands], ignore_index=True).sort_values('total_sample_inj').reset_index(drop=True)
     injs['beam'] = obsi.beam_int
     injs['missed'] = injs['missed'].astype(bool)
 
     return injs
 
+
+def add_missed_cols_etc(close_cands, missed_inj, found_in='unspec'):
+    """Add columns from missed_inj to the highest close cand"""
+    max_snr = close_cands['SNR'].idxmax()
+    close_cands = close_cands.loc[max_snr:max_snr+1].copy()
+    close_cands['classification'] = found_in
+    missing_columns = [col for col in missed_inj.index if not pd.isna(col)]  # if col not in close_cands.columns
+    close_cands = close_cands.assign(**{col: missed_inj[col] for col in missing_columns})
+    return close_cands
+
+
 def count_found_clusters(found_injs, raw_cand_file):
     """Count the clusters of found injections.
 
-    This has been outsourced cause it is time consuming.
+    This has been outsourced cause it is time consuming (i.e. slow af).
     """
     raw_cands = pd.read_csv(raw_cand_file, index_col=0)
     found_injs = found_injs.copy()  # Avoid setting on copy warnings.
     for i in found_injs.index:
         close_raws = find_close_cands(raw_cands, found_injs.loc[i])
-        found_injs.loc[i, 'n_clusters'] = len(close_raws['cluster_id'].unique())
+        if isinstance(close_raws['cluster_id'], np.number):
+            found_injs.loc[i, 'n_clusters'] = 1
+        else:
+            found_injs.loc[i, 'n_clusters'] = len(close_raws['cluster_id'].unique())
 
     return found_injs
+
 
 def add_yaml_parameters(injs, yaml_path):
     """Add some injected parameters that have not been saved by the classifier."""
@@ -304,7 +339,7 @@ def find_close_cands(raw_cands, inj, space_check=True):
     if isinstance(inj, pd.DataFrame):
         inj = inj.squeeze()  # Avoid error.
 
-    before, after = total_burst_length(inj['dm_pccm3_inj'], width=0, bonus=64)
+    before, after = total_burst_length(inj['dm_pccm3_inj'], width=0, bonus=0)
 
     close_in_time = ((raw_cands['total_sample'] > (inj['total_sample_inj'] - before))
                      & (raw_cands['total_sample'] < (inj['total_sample_inj'] + before)))
@@ -313,7 +348,7 @@ def find_close_cands(raw_cands, inj, space_check=True):
     # close_in_dm = ((raw_cands['dm_pccm3'] > (inj['dm_pccm3_inj'] - dm_dist))
     #                & (raw_cands['dm_pccm3'] < (inj['dm_pccm3_inj'] + dm_dist)))
     if space_check:
-        close_in_space = np.sqrt((raw_cands['lpix']-inj['lpix'])**2 + (raw_cands['mpix']-inj['mpix'])**2) < 5
+        close_in_space = np.sqrt((raw_cands['lpix']-inj['lpix_inj'])**2 + (raw_cands['mpix']-inj['mpix_inj'])**2) < 5
         raw_cands = raw_cands[close_in_space]
 
     return raw_cands
@@ -372,50 +407,44 @@ def list_to_str(int_list):
     return ''.join([str(beam)+', ' for beam in sorted(int_list)])[:-2]
 
 
-def plot_injection_param(injected, detected, parameter_name):
-    """For one parameter plot the injected against the detected signal.
+def test_closest_inj(injs):
+    if not np.all((injs['INJ_closest'] == injs['INJ_name']) | injs['INJ_closest'].isna()):
+        warnings.warn(f"Found injection is not the closest in time:\n{injs[(injs['INJ_closest'] == injs['INJ_name']) | injs['INJ_closest'].isna()]}")
 
-    Return a figure with two axis, the second holding the difference between injected and detected parameters.
-    """
-    height_ratios = (2, 1)
-    fig, (ax, ax2) = plt.subplots(2, 1, sharex=True, gridspec_kw={'hspace': 0.04, 'height_ratios' : (2, 1)},
-                                  figsize=(4.8, 6.4))
-    ax.plot(injected, detected, '.')
-    ax2.plot(injected, detected-injected, '.')
 
-    # Label.
-    ax2.set_xlabel(f"Injected {parameter_name}")
-    ax.set_ylabel(f"Detected {parameter_name}")
-    ax2.set_ylabel("Injected $-$ detected")
+def test_id_presence(obsi):
+    """Assert that every cluster is once and only once in the catalogs."""
+    # Only use candidate files that exist.
+    cand_files = [file for file in [obsi.rfi_path, obsi.found_inj_path, obsi.uniq_path] if file]
+    raws = pd.read_csv(obsi.raw_cand_file, index_col=0)[['cluster_id', 'spatial_id']]
+    cluster_ids = raws['cluster_id'].unique()
+    in_file = np.zeros((len(cand_files), len(cluster_ids)), dtype=int)
+    for i, file in enumerate(cand_files):
+        file_ids = pd.read_csv(file, index_col=0)['cluster_id'].astype(int).values
+        in_file[i] = np.sum(cluster_ids[:, None] == file_ids, axis=1)
 
-    # Set limits.
-    max_data = np.max([detected, injected])
-    min_data = np.min([detected, injected])
-    excess = (max_data-min_data)/20
-    lim = [min_data-excess, max_data+excess]
-    ax.set_xlim(lim)
-    ax.set_ylim(lim)
-    ax2.set_xlim(lim)
-    ax.set_aspect('equal', 'box')
+    presences = in_file.sum(axis=0)
 
-    # Make the second axis have the same width.
-    x1,x2 = ax2.get_xlim()
-    y1,y2 = ax2.get_ylim()
-    xrange = x2-x1
-    yrange = y2-y1
-    ax2.set_aspect(height_ratios[1]/height_ratios[0]*xrange/yrange)
-
-    #fig.tight_layout()
-
-    return fig
+    # If a cluster is present in several files it must have different spatial IDs.
+    lone_cluster_ids = np.nonzero(presences > 1)[0]
+    lone = raws.loc[raws['cluster_id'].isin(lone_cluster_ids)]
+    n_spatial_clusters = lone.groupby('cluster_id')['spatial_id'].apply(lambda gdf: len(gdf.unique()))
+    problematic = n_spatial_clusters != presences[presences > 1]
+    if np.any(problematic):
+        print("Non-unique cluster ID detected. Number in Raw:")
+        print(n_spatial_clusters.loc[problematic])
+        print("Numbers in rfi, inj, uniq catalogs:")
+        print(in_file[:, presences > 1][:, problematic])
+    # assert not np.any(problematic)
+    # return np.all(problematic)
 
 
 if __name__ == '__main__':
-    obs_id =  "SB058479"  #"SB057623"  #"SB057472"
+    sbid =  "SB058479"  #"SB057623"  #"SB057472"
     fig_path='/data/craco/craco/jah011/'
     run='inj1'
 
-    collated_data = get_injection_results(obs_id, run)
+    collated_data = get_injection_results(sbid, run)
 
     beam_numbers = np.sort(collated_data['beam'].unique())
     all_found = beam_numbers[~collated_data.groupby('beam')['missed'].any()]
@@ -439,22 +468,22 @@ if __name__ == '__main__':
     # detected, injected = collated_data['snr'], collated_data['SNR'].fillna(5)
     # parameter_name = "SNR"
     # fig = plot_injection_param(detected, injected, parameter_name)
-    # fig.savefig(fig_path + f"injection_SNR_{obs_id}_{run}.png")
+    # fig.savefig(fig_path + f"injection_SNR_{sbid}_{run}.png")
 
     # # Plot DMs.
     # detected, injected = collated_data['dm_pccm3_inj'], collated_data['dm_pccm3']
     # parameter_name = "DM (pc/cm$^3$)"
     # fig = plot_injection_param(detected, injected, parameter_name)
-    # fig.savefig(fig_path + f"injection_DM_{obs_id}.png")
+    # fig.savefig(fig_path + f"injection_DM_{sbid}.png")
 
     # # Plot lpix.
     # detected, injected = collated_data['lpix'], collated_data['lpix']
     # parameter_name = "lpix"
     # fig = plot_injection_param(detected, injected, parameter_name)
-    # fig.savefig(f"injection_lpix_{obs_id}.png")
+    # fig.savefig(f"injection_lpix_{sbid}.png")
 
     # # Plot mpix.
     # detected, injected = collated_data['mpix'], collated_data['mpix']
     # parameter_name = "mpix"
     # fig = plot_injection_param(detected, injected, parameter_name)
-    # fig.savefig(f"injection_mpix_{obs_id}.png")
+    # fig.savefig(f"injection_mpix_{sbid}.png")
