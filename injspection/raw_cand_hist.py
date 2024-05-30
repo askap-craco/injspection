@@ -5,6 +5,10 @@ import numpy as np
 import pandas as pd
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+import json
+
+from time import time
+from tqdm import tqdm
 
 from glob import glob
 
@@ -14,8 +18,39 @@ from craco.datadirs import format_sbid
 from .check_injections import InjectionResults
 
 
-def get_raws_from_sbrange(sb_start, sb_end=None, exclude_single_events=False, get_raws=True):
+def get_raws_from_sbrange(sb_start, sb_end=None, exclude_single_events=False):
     """Get the raw SNR and DM from a range of SBs."""
+    func_returns, log_dicts, sb_end = loop_schedblocks(get_uniq_raws, sb_start, sb_end=sb_end,
+                                                                     exclude_single_events=exclude_single_events)
+
+    raw_SNR_dm = [fr[0] for fr in func_returns]
+    uniq_SNR_dm = [fr[1] for fr in func_returns]
+
+    if raw_SNR_dm:
+        raw_SNR_dm = pd.concat(raw_SNR_dm)
+    if uniq_SNR_dm:
+        uniq_SNR_dm = pd.concat(uniq_SNR_dm)
+
+    return raw_SNR_dm, uniq_SNR_dm, log_dicts, sb_end
+
+
+def loop_schedblocks(func, sb_start, sb_end=None, **func_kwargs):
+    """Loop over scheduling blocks/observations and call func on each.
+
+    Args:
+        func (function): Function that takes an InjectionResults object as the
+            first argument and a dictionary with SB information as the second.
+        sb_start (int): Start schedblock.
+        sb_end (int): Last schedblock exclusive. If None: only process sb_start.
+            If very high: process until the latest existing schedblock.
+        func_kwargs (dict): Keywords to give to func
+    Returns:
+        List of func returns.
+        List of Observation durations.
+        Dictionary with information about the processed schedblocks.
+        sb_end
+    """
+    t0 = time()
     if not sb_end:
         sb_end = sb_start + 1  # Search only one SB.
 
@@ -28,67 +63,107 @@ def get_raws_from_sbrange(sb_start, sb_end=None, exclude_single_events=False, ge
         sb_end = os.path.basename(sb_end)
         sb_end = int(format_sbid(sb_end)[2:]) + 1
 
-    raw_SNR_dm = []
-    uniq_SNR_dm = []
-    obs_durations = []
-    log_dics = []
+    t1 = t2 = t3= t4 = 0
+    func_returns = []
+    log_dicts = []
     # sbid = sb_start
-    for sbid in range(sb_start, sb_end):
+    for sbid in tqdm(range(sb_start, sb_end)):
+        t = time()
         sbid = format_sbid(sbid)
         run = 'results'
 
         # Define Data locations to be searched.
         inj_pattern = os.path.join('/CRACO/DATA_??/craco/', sbid, 'scans/??/*/', run)
 
-       # For every found log file try to get the candidates.
+        # For every found log file try to get the candidates.
         log_files = sorted(glob(os.path.join(inj_pattern, 'search_pipeline_b??.log')))
+        t1 += time()-t
         for file in log_files:
+            t = time()
             scan = file[file.find('scans/')+6 : file.find('scans/') + 8]
             scantime = file[file.find('scans/')+9 : file.find('scans/') + 23]
             beam = file[file.find('pipeline_b')+10 : file.find('pipeline_b') + 12]
 
             obsi = InjectionResults(sbid, beam, scan=scan, run=run, scantime=scantime)
-            if get_raws and obsi.raw_cand_file:
-                raw_cands = pd.read_csv(obsi.raw_cand_file)
-                if exclude_single_events:
-                    cluster_members = raw_cands.groupby('cluster_id').count()['SNR']
-                    raw_cands = raw_cands[raw_cands['cluster_id'].isin(cluster_members[cluster_members > 1].index)]
+            t2 += time()-t
+            t = time()
 
-                raw_cands['sbid'] = sbid
-                raw_cands['beam'] = beam
-                raw_SNR_dm.append(raw_cands[['SNR', 'dm']])
+            # Save info about the SB.
+            log_dict = {'sbid' : sbid, 'scan' : scan, 'scantime' : scantime, 'beam' : beam,}
+                            #  'raws' : bool(obsi.raw_cand_file), 'uniqs' : bool(obsi.uniq_path),
+                            #  'time' : bool(obsi.pcb_path)})
+            t3 += time()-t
+            t = time()
 
-                # Get raws that were later classified as unique.
-                if obsi.uniq_path:
-                    uniq_cands = pd.read_csv(obsi.uniq_path, index_col=0)
-                    known_source = ~uniq_cands.loc[:, 'PSR_name':'ALIAS_sep'].isna().all(axis=1)
-                    uniq_ids = uniq_cands.loc[known_source, 'cluster_id'].astype(int).values
-                    uniq_raws = raw_cands[~raw_cands['cluster_id'].isin(uniq_ids)]
+            # Apply func to the observation.
+            func_returns.append(func(obsi, log_dict, **func_kwargs))
+            t4 += time()-t
+            log_dicts.append(log_dict)
 
-                    # no_known_source = uniq_cands.loc[:, 'PSR_name':'ALIAS_sep'].isna().all(axis=1)
-                    # uniq_ids = uniq_cands.loc[no_known_source, 'cluster_id'].astype(int).values
-                    # uniq_raws = raw_cands[raw_cands['cluster_id'].isin(uniq_ids)]
-                    # uniq_cands = uniq_cands.loc[no_known_source]
+    if log_dicts:
+        log_dicts = pd.DataFrame(log_dicts)
+    print(t1,t2,t3,t4,time()-np.sum([t1,t2,t3,t4])-t0)
+    return func_returns, log_dicts, sb_end
 
-                    uniq_SNR_dm.append(uniq_raws[['sbid', 'beam', 'SNR', 'dm']])
 
-            if obsi.pcb_path:
-                # Get the observation duration
-                f = sigproc.SigprocFile(obsi.pcb_path)
-                obs_durations.append(f.observation_duration)
-            log_dics.append({'sbid':sbid, 'scan':scan, 'scantime':scantime, 'beam':beam,
-                             'raws': bool(obsi.raw_cand_file), 'uniqs':bool(obsi.uniq_path),
-                             'time':bool(obsi.pcb_path)})
+def get_fil_info(obsi, log_dict):
+    """Get the observation duration"""
+    if obsi.pcb_path:
+        f = sigproc.SigprocFile(obsi.pcb_path)
+        keys_of_interest = ['nbits', 'nchans', 'nifs', 'src_raj', 'src_dej', 'tstart', 'tsamp', 'fch1', 'foff']
+        pcb_dict = {key: f.header[key] for key in keys_of_interest}
+        pcb_dict['obs_duration'] = f.observation_duration
 
-    if raw_SNR_dm:
-        raw_SNR_dm = pd.concat(raw_SNR_dm)
-    if uniq_SNR_dm:
-        uniq_SNR_dm = pd.concat(uniq_SNR_dm)
-    if obs_durations:
-        obs_durations = np.array(obs_durations)
-    if log_dics:
-        log_dics = pd.DataFrame(log_dics)
-    return raw_SNR_dm, uniq_SNR_dm, obs_durations, log_dics, sb_end
+        # Get number of masked channels.
+        try:
+            data = f.get_data(slice(0,1))
+            pcb_dict['n_nonzero_chans'] = np.sum((data != 0.))
+        except:
+            # print(f'fil file could not load, {obsi.sb_id, obsi.beam}.')
+            pass
+
+        if log_dict:
+            pcb_dict.update(log_dict)
+
+        # Get flagged ants.
+        flagged_path = f'/CRACO/DATA_00/craco/{obsi.sb_id}/{obsi.sb_id}.antflag.json'
+        if obsi.beam == '00' and os.path.exists(flagged_path):
+            with open(flagged_path) as f:
+                flagants = json.load(f)['flagants']
+                flagants = [int(fa) for fa in flagants.strip('[]').split(',') if fa]
+                flagants = np.array(flagants)
+                pcb_dict['n_flagants'] = np.count_nonzero(flagants < 24)
+
+        return pcb_dict
+
+
+def get_uniq_raws(obsi, exclude_single_events=False):
+    """Get raws that were later classified as unique."""
+    # if obsi.raw_cand_file:
+    raw_cands = pd.read_csv(obsi.raw_cand_file)
+    if exclude_single_events:
+        cluster_members = raw_cands.groupby('cluster_id').count()['SNR']
+        raw_cands = raw_cands[raw_cands['cluster_id'].isin(cluster_members[cluster_members > 1].index)]
+
+    raw_cands['sbid'] = obsi.sbid
+    raw_cands['beam'] = obsi.beam
+    raw_SNR_dm = raw_cands[['SNR', 'dm']]
+
+    # Get raws that were later classified as unique.
+    if obsi.uniq_path:
+        uniq_cands = pd.read_csv(obsi.uniq_path, index_col=0)
+        known_source = ~uniq_cands.loc[:, 'PSR_name':'ALIAS_sep'].isna().all(axis=1)
+        uniq_ids = uniq_cands.loc[known_source, 'cluster_id'].astype(int).values
+        uniq_raws = raw_cands[~raw_cands['cluster_id'].isin(uniq_ids)]
+
+        # no_known_source = uniq_cands.loc[:, 'PSR_name':'ALIAS_sep'].isna().all(axis=1)
+        # uniq_ids = uniq_cands.loc[no_known_source, 'cluster_id'].astype(int).values
+        # uniq_raws = raw_cands[raw_cands['cluster_id'].isin(uniq_ids)]
+        # uniq_cands = uniq_cands.loc[no_known_source]
+
+        uniq_SNR_dm = uniq_raws[['sbid', 'beam', 'SNR', 'dm']]
+
+    return raw_SNR_dm, uniq_SNR_dm
 
 
 def calculate_level_positions(snr, time, levels=np.array([10, 100, 1000])):
@@ -163,17 +238,17 @@ def plot_hist2d(x, y, xstep=1, ystep=1, x_min=None, x_max=None, y_min=None, y_ma
 
 def make_hist_of_sb_range(sb_start, sb_end=None, levels=[1000, 10000], fig_path=None, all_raw=False, **plot_kw):
     """Main function calling the rest"""
-    raw_SNR_dm, uniq_SNR_dm, obs_durations, log_dics, sb_end = get_raws_from_sbrange(sb_start, sb_end,
+    raw_SNR_dm, uniq_SNR_dm, log_dicts, sb_end = get_raws_from_sbrange(sb_start, sb_end,
                                                                                      exclude_single_events=False)
 
     # Do a quick test.
-    compatible_file_presences = (not np.any(log_dics['uniqs'] & ~log_dics['time'])
-                                 and not np.any(log_dics['raws'] & ~log_dics['time']))
+    compatible_file_presences = (not np.any(log_dicts['uniqs'] & ~log_dicts['time'])
+                                 and not np.any(log_dicts['raws'] & ~log_dicts['time']))
     if not compatible_file_presences:
         print("Problem Sir")
 
     # Calculate events per minute for cumulative SNR.
-    total_time = obs_durations.sum() / 36 / 60  # /n_beams and s to minutes
+    total_time = log_dicts['obs_duration'].sum() / 36 / 60  # /n_beams and s to minutes
     levels = [3, 94] + levels
     level_snrs_uniq, level_index_uniq, fp_per_minute_uniq = calculate_level_positions(uniq_SNR_dm['SNR'], total_time,
                                                                                       levels=levels)
