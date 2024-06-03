@@ -3,13 +3,16 @@ import warnings
 import numpy as np
 import pandas as pd
 import yaml
+import pickle
 
 from glob import glob
+from scipy.optimize import curve_fit
 
 from craft import sigproc
 from craft import uvfits
 
 from .create_injection_params_file import total_burst_length
+from injspection.plot_results import make_all_pretty_plots
 
 
 class InjectionResults:
@@ -28,9 +31,7 @@ class InjectionResults:
             clustering_dir (str): Directory with the results of the clustering
             tsamp (float): Sampling time (s). This is not in the logs.
         """
-        # Allow for the five digit SB number only.
-        if len(str(sbid)) == 5:
-            sbid = 'SB0' + str(sbid)
+        sbid = sbid_str(sbid)
 
         # Make beam possible as int and str.
         if isinstance(beam, np.integer):
@@ -158,6 +159,14 @@ class InjectionResults:
         injs = check_masked_channels(injs, filpath=self.pcb_path)
 
         return injs
+
+
+def sbid_str(sbid):
+    """Convert the five digit SB number to SB0XXXXX."""
+    if len(str(sbid)) == 5:
+        sbid = 'SB0' + str(sbid)
+
+    return sbid
 
 
 def path_if_exists(path):
@@ -314,6 +323,7 @@ def check_masked_channels(injs, filpath):
 def get_injection_results(sbid, run='inj', obs_path_pattern='/CRACO/DATA_??/craco/', scan_pattern='scans/??/*/',
                           clustering_dir='clustering_output'):
     """For the given injection run get the found and missed candidates."""
+    sbid = sbid_str(sbid)
     # Define Data locations to be searched.
     inj_pattern = os.path.join(obs_path_pattern, sbid, scan_pattern, run)
 
@@ -439,12 +449,138 @@ def test_id_presence(obsi):
     # return np.all(problematic)
 
 
-if __name__ == '__main__':
-    sbid =  "SB058479"  #"SB057623"  #"SB057472"
-    fig_path='/data/craco/craco/jah011/'
-    run='inj1'
+def select_candidate(group, snr_discard=9):
+    """For Every group select one candidate to keep.
 
-    collated_data = get_injection_results(sbid, run)
+    If there is non-RFI candidates take the one with maximum SNR of those,
+    otherwise just take the max SNR one.
+    """
+    if len(group) == 1:
+        primary_cand = True
+    else:
+        primary_cand = (group['SNR'] > snr_discard) & (group['classification'] != 'rfi')
+        if primary_cand.any():
+            primary_cand &= group['SNR'] == group.loc[primary_cand, 'SNR'].max()
+        else:
+            primary_cand = group['SNR'] == group['SNR'].max()
+
+    return primary_cand
+
+
+def beam_model(lmpix, eta=0.9, phi=0.6, lpix0=128, mpix0=128):
+    """Loss in SNR due to efficiency and pixelization.
+
+    lpix, mpix (int, float, or array): Pixel position
+    eta (float): Efficiency at beam center.
+    phi (float): Fraction of the total primary beam covered by the pixel grid.
+    lpix0, mpix0 (int or float): Beam center.
+    """
+    lpix, mpix = lmpix[:, 0], lmpix[:, 1]
+    theta_l = np.pi*phi*(lpix-lpix0)/256
+    theta_m = np.pi*phi*(mpix-mpix0)/256
+    return eta*np.cos(np.sqrt(theta_l**2 + theta_m**2))
+
+
+def fit_beams(data, fix_mpix0=False, fix_lpix0=False):
+    """"Fit a beam model to the injections."""
+    if fix_mpix0 and fix_lpix0:
+        raise ValueError("One of lpix and mpix must be fitted. Otherwise what's the point?")
+
+    if fix_mpix0 or fix_lpix0:
+        p0 = [1, .5, 128]
+    else:
+        p0 = [1, .5, 128, 128]
+    beams = data['beam'].unique()
+    beam_fit = []
+    for beam in beams:
+        beam_data = data[data['beam'] == beam]
+        pixels = beam_data[['lpix_inj', 'mpix_inj']].dropna().astype(np.float64).to_numpy()
+        if fix_lpix0:
+            # Swap columns such that mpix will be fitted
+            pixels = pixels[:,::-1]
+        recovery_fraction = beam_data['SNR/SNR_inj'].dropna().astype(np.float64).to_numpy()
+        fit = curve_fit(beam_model, pixels, recovery_fraction, p0=p0, maxfev=1000)
+        beam_fit.append(fit)
+
+    bestfit, uncert = [fit[0] for fit in beam_fit], [fit[1] for fit in beam_fit]
+    bestfit, uncert = np.stack(bestfit), np.stack(uncert)
+
+    return beams, bestfit, uncert
+
+
+def collate_observation_data(sbid, run='inj', clustering_dir='clustering_output'):
+    """Get the data for one sbid, clean it up a bit, and give out some numbers."""
+    collated_data = get_injection_results(sbid, run, clustering_dir=clustering_dir)
+
+    # Drop some unused columns.
+    collated_data = collated_data.drop(columns=['time', 'iblk', 'rawsn', 'obstime_sec', 'mjd', 'total_sample_middle', 'mSNR', 'mSlope',
+        'mSlopeSmooth', 'lpix_rms', 'mpix_rms', 'num_samps', 'centl', 'centm'])
+
+    # Get one of the beams.
+    obsi = InjectionResults(sbid, collated_data['beam'].iloc[0], run, clustering_dir=clustering_dir)
+
+    # Exclude injections at times where all channels are flagged.
+    no_data = collated_data['masked'] == 0.
+    print(f"{no_data.sum()} injections were outside the file or in a dropout.")
+    collated_data = collated_data[~no_data]
+
+    # Exclude too high DMs
+    obsi.yaml_path = path_if_exists(obsi.get_yaml_path())
+    obsi.calculate_dm_pccm3()
+    too_high_dm = collated_data['dm_pccm3_inj'] > obsi.dm_pccm3
+    print(f"{too_high_dm.sum()} injections had a DM higher than the searched DM.")
+    collated_data = collated_data[~too_high_dm]
+
+    # Pick only the highest SNR candidates from every injection, but prefer non-RFI ones.
+    snr_discard = 9
+    highest_snr = collated_data.groupby(['beam', 'INJ_name'])['SNR'].transform('max') == collated_data['SNR']
+    selected_candidates = collated_data.groupby(['beam', 'INJ_name'], sort=False).apply(lambda g: select_candidate(g, snr_discard))
+    selected_candidates = selected_candidates.explode().astype(bool).to_numpy()
+    print(f"{(~selected_candidates).sum()} injections were side clusters.")
+    n_groups_eq_sel_cands = collated_data.groupby(['beam', 'INJ_name'], sort=False).ngroups == selected_candidates.sum()
+    multiple_cands_per_group = np.any(collated_data[selected_candidates].groupby(['beam', 'INJ_name'])['SNR'].count() != 1)
+    if not n_groups_eq_sel_cands or multiple_cands_per_group:
+        print("Problem with the candidate selection.")
+    collated_data = collated_data[selected_candidates]
+    collated_data["also_in_rfi"] = (selected_candidates & ~highest_snr)[selected_candidates]
+
+    # See if it is marked as a known source.
+    collated_data['known_source'] = ~collated_data[['PSR_name', 'PSR_sep', 'RACS_name', 'RACS_sep', 'NEW_name', 'NEW_sep', 'ALIAS_name', 'ALIAS_sep']].isna().all(axis=1)
+
+    collated_data = collated_data.sort_values(['beam', 'total_sample_inj']).reset_index()
+
+    collated_data['SNR/SNR_inj'] =  collated_data['SNR'] / collated_data['SNR_inj'] / np.sqrt(collated_data['masked'])
+
+    # Fit a beam model to the lpix, mpix data.
+    not_seen = collated_data['missed'] & collated_data['SNR'].isna()
+    data = collated_data[~not_seen]
+    multiple_lpix = not np.all(collated_data['lpix_inj'] == collated_data.loc[0, 'lpix_inj'])
+    multiple_mpix = not np.all(collated_data['mpix_inj'] == collated_data.loc[0, 'mpix_inj'])
+    if multiple_lpix and multiple_mpix:
+        beams, bestfit, uncert = fit_beams(data)
+    elif not multiple_lpix and not multiple_mpix:
+        print("No variation in lpix nor mpix. Not fitting the beam. Resorting to default beam shape.")
+        beams = collated_data['beam'].unique()
+        bestfit = np.array(len(beams)*[[0.9, 0.6, 128, 128]])
+        uncert = None
+    elif multiple_mpix:
+        beams, bestfit, uncert = fit_beams(data, fix_lpix0=True)
+    elif multiple_lpix:
+        beams, bestfit, uncert = fit_beams(data, fix_mpix0=True)
+
+    for i, beam in enumerate(beams):
+        lmpix = collated_data.loc[collated_data['beam'] == beam, ['lpix', 'mpix']].to_numpy()
+        if multiple_mpix and not multiple_lpix:
+            # Swap columns such that mpix fit will be use for mpix
+            lmpix = lmpix[:,::-1]
+        collated_data.loc[collated_data['beam'] == beam, 'recovery'] = beam_model(lmpix, *bestfit[i])
+
+    collated_data['SNR_expected'] = collated_data['SNR_inj'] * collated_data['recovery'] * np.sqrt(collated_data['masked'])
+    collated_data['SNR/SNR_expected'] = collated_data['SNR'] / collated_data['SNR_expected']
+
+    return collated_data, bestfit, uncert
+
+def report_outcomes(collated_data):
 
     beam_numbers = np.sort(collated_data['beam'].unique())
     all_found = beam_numbers[~collated_data.groupby('beam')['missed'].any()]
@@ -454,36 +590,63 @@ if __name__ == '__main__':
 
     beams_missed_injs = collated_data.loc[collated_data['missed'], 'beam'].to_list()
     print(f"{len(beams_missed_injs)} injections have been missed. These are in beams {list_to_str(beams_missed_injs)}.")
+    print(f"{collated_data['known_source'].sum()} injections have been marked as known sources.")
 
-    # Print differing pixel positions.
-    # print(collated_data[(collated_data['lpix'] != 100) & (collated_data[collated_data['mpix'] != 100])])
+    # Check misclassified classification.
+    misclassified = collated_data['missed'] & (~collated_data['SNR'].isna())
 
-    # collated_data[collated_data['INJ_name']=='INJ_4']
-    # # print(collated_data.groupby('INJ_name')['SNR'].apply(np.median))
+    # Missed statistics based on SNR.
+    rfi = (misclassified & (collated_data['classification'] == 'rfi'))
+    print("Classified as RFI:\n"
+        fr"total: {rfi.sum()}/{collated_data.shape[0]}")
+    if rfi.any():
+        less7 = np.sum(rfi & (collated_data['SNR'] <= 7))
+        n_less7 = np.sum(collated_data['SNR'] <= 7)
+        less9 = np.sum(rfi & (collated_data['SNR'] > 7) & (collated_data['SNR'] <= 9))
+        n_less9 = np.sum((collated_data['SNR'] > 7) & (collated_data['SNR'] <= 9))
+        great9 = np.sum(rfi & (collated_data['SNR'] > 9))
+        n_great9 = np.sum(collated_data['SNR'] > 9)
+        print(f"SNR<=7: {less7}/{n_less7}\n"
+            f"7<SNR<=9: {less9}/{n_less9}\n"
+            f"SNR>9: {great9}/{n_great9}\n")
 
-    # collated_data['SNR/snr'] = collated_data['SNR'] / collated_data['snr']
-    # # print(collated_data.groupby('INJ_name')['SNR/snr'].apply(np.median))
+    # Known sources by SNR.
+    known = collated_data['known_source']
+    print(fr"Classified as a known source:")
+    print(fr"total: {known.sum()}/{collated_data.shape[0]}")
+    if known.any():
+        less7 = np.sum(known & (collated_data['SNR'] <= 7))
+        n_less7 = np.sum(collated_data['SNR'] <= 7)
+        less9 = np.sum(known & (collated_data['SNR'] > 7) & (collated_data['SNR'] <= 9))
+        n_less9 = np.sum((collated_data['SNR'] > 7) & (collated_data['SNR'] <= 9))
+        great9 = np.sum(known & (collated_data['SNR'] > 9))
+        n_great9 = np.sum(collated_data['SNR'] > 9)
+        print(f"SNR<=7:{less7}/{n_less7}\n"
+            f"7<SNR<=9: {less9}/{n_less9}\n"
+            f"SNR>9: {great9}/{n_great9}")
 
-    # # Plot SNRs.
-    # detected, injected = collated_data['snr'], collated_data['SNR'].fillna(5)
-    # parameter_name = "SNR"
-    # fig = plot_injection_param(detected, injected, parameter_name)
-    # fig.savefig(fig_path + f"injection_SNR_{sbid}_{run}.png")
+    # Percent classified missed
+    missed = collated_data['SNR'].isna() | rfi | collated_data['known_source']
+    print(f"Total missed: {np.sum(missed)}/{collated_data.shape[0]} = {np.sum(missed)/collated_data.shape[0] * 100:.2f} %")
 
-    # # Plot DMs.
-    # detected, injected = collated_data['dm_pccm3_inj'], collated_data['dm_pccm3']
-    # parameter_name = "DM (pc/cm$^3$)"
-    # fig = plot_injection_param(detected, injected, parameter_name)
-    # fig.savefig(fig_path + f"injection_DM_{sbid}.png")
+    # Save some numbers to disk.
+    to_save = {'total' : len(collated_data),
+               'missed' : missed.sum(),
+               'rfi' : rfi.sum(),
+               'known' : known.sum(),
+               }
 
-    # # Plot lpix.
-    # detected, injected = collated_data['lpix'], collated_data['lpix']
-    # parameter_name = "lpix"
-    # fig = plot_injection_param(detected, injected, parameter_name)
-    # fig.savefig(f"injection_lpix_{sbid}.png")
+    return to_save
 
-    # # Plot mpix.
-    # detected, injected = collated_data['mpix'], collated_data['mpix']
-    # parameter_name = "mpix"
-    # fig = plot_injection_param(detected, injected, parameter_name)
-    # fig.savefig(f"injection_mpix_{sbid}.png")
+
+def injspect(sbid, run='inj', clustering_dir='clustering_output', fig_path=None):
+    sbid = sbid_str(sbid)
+    if not fig_path:
+        fig_path = f"/data/craco/craco/jah011/{sbid}/{run}_{clustering_dir}"
+    if not os.path.exists(fig_path):
+        os.makedirs(fig_path)
+    collated_data, pixelfit, pixelfit_unc = collate_observation_data(sbid, run=run,
+                                                                     clustering_dir=clustering_dir)
+    to_save = report_outcomes(collated_data)
+    pickle.dump([to_save, pixelfit, pixelfit_unc], open(os.path.join(fig_path, 'some_variables.pkl'), 'wb'))
+    make_all_pretty_plots(collated_data, pixelfit, pixelfit_unc, fig_path=fig_path, sbid=sbid, run=run)
