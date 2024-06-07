@@ -48,9 +48,13 @@ def plot_injection_param(injected, detected, parameter_name):
     min_data = np.min([detected, injected])
     excess = (max_data-min_data)/20
     lim = [min_data-excess, max_data+excess]
-    ax.set_xlim(lim)
-    ax.set_ylim(lim)
-    ax2.set_xlim(lim)
+    try:
+        ax.set_xlim(lim)
+        ax.set_ylim(lim)
+        ax2.set_xlim(lim)
+    except ValueError:
+        print(parameter_name, lim)
+
     ax.set_aspect('equal', 'box')
 
     # Make the second axis have the same width.
@@ -90,9 +94,9 @@ def plot_var_in_all_beams(selected_data, x_var):
 
         # Make a few masks for different happenings.
         found = ~data['missed'] & ~data['known_source']
-        too_low_snr = (~data['missed']) & (data['SNR'] < snr_low_limit)
-        misclassified = data['missed'] & (~data['SNR'].isna())
-        not_seen = data['missed'] & data['SNR'].isna()
+        too_low_snr = (~data['missed']) & (data['snr'] < snr_low_limit)
+        misclassified = data['missed'] & (~data['snr'].isna())
+        not_seen = data['missed'] & data['snr'].isna()
         misattributed = data['known_source']
         uniq_mc = (data.loc[misclassified, 'classification'] == 'uniq') & ~data.loc[misclassified, 'also_in_rfi']
         side_of_rfi = (data.loc[misclassified, 'classification'] == 'uniq') & data.loc[misclassified, 'also_in_rfi']
@@ -150,9 +154,9 @@ def plot_efficiency(data, snr='SNR_inj', snr_low_limit=9, ms=3):
 
     # Make a few masks for different happenings.
     found = ~data['missed'] & ~data['known_source']
-    too_low_snr = (~data['missed']) & (data['SNR'] < snr_low_limit)
-    misclassified = data['missed'] & (~data['SNR'].isna())
-    not_seen = data['missed'] & data['SNR'].isna()
+    too_low_snr = (~data['missed']) & (data['snr'] < snr_low_limit)
+    misclassified = data['missed'] & (~data['snr'].isna())
+    not_seen = data['missed'] & data['snr'].isna()
     misattributed = data['known_source']
     uniq_mc = data.loc[misclassified, 'classification'] == 'uniq'
 
@@ -233,37 +237,37 @@ def make_all_pretty_plots(collated_data, pixelfit=None, pixelfit_unc=None, fig_p
     fig, axs = plot_var_in_all_beams(collated_data, x_var=x_var)
     if fig_path:
         fig.suptitle(f"{sbid}, {run}")
-        fig.savefig(os.path.join(fig_path, f"{x_var}_efficiency_per_beam.pdf"))
+        fig.savefig(os.path.join(fig_path, f"{x_var}_efficiency_per_beam.png"))
 
     fig, axs = plot_efficiency(collated_data)
     if fig_path:
         fig.suptitle(f"{sbid}, {run}")
-        fig.savefig(os.path.join(fig_path, "efficiency_pre_fit.pdf"))
+        fig.savefig(os.path.join(fig_path, "efficiency_pre_fit.png"))
     fig, axs = plot_efficiency(collated_data, snr='SNR_expected')
     if fig_path:
         fig.suptitle(f"{sbid}, {run}")
-        fig.savefig(os.path.join(fig_path, "efficiency.pdf"))
+        fig.savefig(os.path.join(fig_path, "efficiency.png"))
 
     if pixelfit is None:
         fig, axs = plot_beamfitting(pixelfit, pixelfit_unc)
         if fig_path:
             fig.suptitle(f"{sbid}, {run}")
-            fig.savefig(os.path.join(fig_path, "pixelization_shape.pdf"))
+            fig.savefig(os.path.join(fig_path, "pixelization_shape.png"))
 
-    inj_snr = collated_data.groupby('INJ_name')['SNR']
+    inj_snr = collated_data.groupby('INJ_name')['snr']
     snr_mean, snr_std = inj_snr.mean(), inj_snr.std()
     fig, ax = plt.subplots()
     ax.plot(snr_mean, snr_std, '.')
     ax.set(title=f"{sbid}, {run}", xlabel="SNR", ylabel="Standarddeviation in SNR for each injection")
     if fig_path:
-        fig.savefig(os.path.join(fig_path, "stddev.pdf"))
+        fig.savefig(os.path.join(fig_path, "stddev.png"))
 
     # Plot parameters against their injected values.
     params = ['SNR', 'dm_pccm3', 'lpix', 'mpix', 'total_sample', 'width_samps']
     for param in params:
         injected = collated_data[param+'_inj']
         if param == 'SNR':
-            detected = collated_data[param].fillna(5)
+            detected = collated_data['snr'].fillna(5)
         elif param == 'width_samps':
             detected = collated_data['boxc_width']
         else:
@@ -271,4 +275,4 @@ def make_all_pretty_plots(collated_data, pixelfit=None, pixelfit_unc=None, fig_p
 
         fig, axs = plot_injection_param(injected, detected, param)
         if fig_path:
-            fig.savefig(os.path.join(fig_path, f"injection_{param}_{sbid}.pdf"))
+            fig.savefig(os.path.join(fig_path, f"injection_{param}_{sbid}.png"))

@@ -12,9 +12,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('sbid',
                         help="The schedulingblock ID to be analysed (e.g. 58479)")
-    parser.add_argument('-r', '--run', type=str, default='inj', help="Name of the run.")
+    parser.add_argument('-r', '--run', type=str, default='inj', help='Name of the run (default: "inj").')
     parser.add_argument('-c', '--clustering_dir', type=str, default="clustering_output", help="Name of the directory "
-                        "with clustering files.")
+                        'with clustering files (default: "clustering_output").')
     parser.add_argument('-p', '--fig_path', type=str, help="Directory to save the plots and logs. By default a "
                         "directory in /data/craco/craco/jah011 will be created.")
 

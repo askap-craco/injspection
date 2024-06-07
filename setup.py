@@ -7,5 +7,6 @@ setup(name='injspection',
       author_email='jjahnsschindler@swin.edu.au',
       description='Injection inspection',
       packages=['injspection'],
+      scripts=['bin/injspect.py', 'bin/injspect_all_injs_ever.py'],
       install_requires=[],
 )
