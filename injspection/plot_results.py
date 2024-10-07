@@ -41,7 +41,7 @@ def plot_injection_param(injected, detected, parameter_name):
     # Label.
     ax2.set_xlabel(f"Injected {parameter_name}")
     ax.set_ylabel(f"Detected {parameter_name}")
-    ax2.set_ylabel("Injected $-$ detected")
+    ax2.set_ylabel("Detected $-$ Injected")
 
     # Set limits.
     max_data = np.max([detected, injected])
@@ -207,27 +207,26 @@ def plot_efficiency(data, snr='SNR_inj', snr_low_limit=9, ms=3):
 
 
 def plot_beamfitting(bestfit, uncert):
-    if uncert:
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(TEXTWIDTH, COLUMNWIDTH))
-        plt.rc('axes', labelsize=12)
-        # 0, 1, 2 are Amplitude, freqency/narrowness, phase
-        x, y = 1, 0
-        ax1.errorbar(bestfit[:,x], bestfit[:,y], xerr=np.sqrt(uncert[:,x,x]), yerr=np.sqrt(uncert[:,y,y]), fmt='.')
-        ax1.set_ylabel("Amplitude")
-        ax1.set_xlabel("Covered Beamfraction")
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(TEXTWIDTH, COLUMNWIDTH))
+    plt.rc('axes', labelsize=12)
+    # 0, 1, 2 are Amplitude, freqency/narrowness, phase
+    x, y = 1, 0
+    ax1.errorbar(bestfit[:,x], bestfit[:,y], xerr=np.sqrt(uncert[:,x,x]), yerr=np.sqrt(uncert[:,y,y]), fmt='.')
+    ax1.set_ylabel("Amplitude")
+    ax1.set_xlabel("Covered Beamfraction")
 
-        if bestfit.shape[1] == 4:
-            x, y = 2, 3
-            ax2.errorbar(bestfit[:,x], bestfit[:,y], xerr=np.sqrt(uncert[:,x,x]), yerr=np.sqrt(uncert[:,y,y]), fmt='.')
-            ax2.xlabel("Beam centre l")
-            ax2.ylabel("Beam centre m")
-        else:
-            y = 2
-            ax2.errorbar(range(36), bestfit[:,y], yerr=np.sqrt(uncert[:,y,y]), fmt='.')
-            ax2.xlabel("Beam")
-            ax2.ylabel("Beam centre m")
+    if bestfit.shape[1] == 4:
+        x, y = 2, 3
+        ax2.errorbar(bestfit[:,x], bestfit[:,y], xerr=np.sqrt(uncert[:,x,x]), yerr=np.sqrt(uncert[:,y,y]), fmt='.')
+        ax2.set_xlabel("Beam centre l")
+        ax2.set_ylabel("Beam centre m")
+    else:
+        y = 2
+        ax2.errorbar(range(36), bestfit[:,y], yerr=np.sqrt(uncert[:,y,y]), fmt='.')
+        ax2.set_xlabel("Beam")
+        ax2.set_ylabel("Beam centre m")
 
-        plt.title("Fit results when fitting beams individually")
+    plt.title("Fit results when fitting beams individually")
 
     return fig, (ax1, ax2)
 
@@ -248,7 +247,7 @@ def make_all_pretty_plots(collated_data, pixelfit=None, pixelfit_unc=None, fig_p
         fig.suptitle(f"{sbid}, {run}")
         fig.savefig(os.path.join(fig_path, "efficiency.png"))
 
-    if pixelfit is None:
+    if pixelfit is not None:
         fig, axs = plot_beamfitting(pixelfit, pixelfit_unc)
         if fig_path:
             fig.suptitle(f"{sbid}, {run}")
@@ -258,7 +257,8 @@ def make_all_pretty_plots(collated_data, pixelfit=None, pixelfit_unc=None, fig_p
     snr_mean, snr_std = inj_snr.mean(), inj_snr.std()
     fig, ax = plt.subplots()
     ax.plot(snr_mean, snr_std, '.')
-    ax.set(title=f"{sbid}, {run}", xlabel="SNR", ylabel="Standarddeviation in SNR for each injection")
+    ax.set(title=f"{sbid}, {run}", xlabel="SNR", ylabel="Stddev in SNR for each injection")
+    fig.tight_layout()
     if fig_path:
         fig.savefig(os.path.join(fig_path, "stddev.png"))
 
