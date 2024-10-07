@@ -4,6 +4,7 @@ folders starting with inj.
 """
 import os
 import argparse
+import warnings
 
 from pathlib import Path
 from glob import glob
@@ -46,4 +47,9 @@ if __name__ == '__main__':
         fig_path = os.path.join(args.fig_path, sbid, f"{run}_{clustering_dir}")
         # print(fig_path)
         if args.force or not os.path.exists(fig_path):
-            injspect(sbid, run=run, clustering_dir=clustering_dir, fig_path=fig_path)
+            try:
+                injspect(sbid, run=run, clustering_dir=clustering_dir, fig_path=fig_path)
+            except Exception as err:
+                warning = RuntimeWarning(*err.args)
+                warning.with_traceback(err.__traceback__)
+                print(warning)
