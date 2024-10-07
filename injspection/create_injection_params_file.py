@@ -269,7 +269,7 @@ if __name__ == '__main__':
     random_setup = {'num' : 100, 'tsep' : 100, 't_res' : 13.8, 'snr' : (9, 20), 'dm' : (10, 1200),
                     'inj_upix' : (0, 255), 'inj_vpix' : (0, 255), 'width_samps' : (1, 8), 'subsample_phase' : (0,1)}  # 'blockstep' : 5, doesn't work
     # DM >~811 cannot be detected.
-    random_setup = {'num' : 100, 'tsep' : 100, 't_res' : 13.8, 'snr' : (9, 20), 'dm' : (10, 800),
+    random_setup = {'num' : 400, 'tsep' : 100, 't_res' : 13.8, 'snr' : (9, 20), 'dm' : (10, 800),
                     'inj_upix' : (0, 255), 'inj_vpix' : (0, 255), 'width_samps' : (1, 8), 'subsample_phase' : (0,1)}
 
     # Make the injection parameters with the given setup
@@ -282,9 +282,10 @@ if __name__ == '__main__':
 
     check_injection_times(params, t_res=13.8)
 
-    print(os.path.dirname(os.path.abspath(__file__)))
-    inj_dir = os.path.dirname(os.path.abspath(__file__))
-    outfile = os.path.join(inj_dir, 'yaml_files/randomized_2_limit_DM.yml')
+    # print(os.path.dirname(os.path.abspath(__file__)))
+    # inj_dir = os.path.dirname(os.path.abspath(__file__))
+    # outfile = os.path.join(inj_dir, 'yaml_files/randomized_2_limit_DM.yml')
+    outfile = '/CRACO/SOFTWARE/craco/jah011/injections/yaml_files/randomized_3_spectra.yml'
     with open(outfile, 'w') as f:
         yaml.dump(params, f)
 
