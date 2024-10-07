@@ -47,32 +47,41 @@ class InjectionResults:
 
         # Define Data locations to be searched.
         obs_path_pattern = '/CRACO/DATA_??/craco/'
-        inj_pattern = os.path.join(obs_path_pattern, sbid, 'scans/', scan, scantime, run, f'search_pipeline_b{beam}.log')
-        log_paths = glob(inj_pattern)
-        if len(log_paths) == 0:
-            raise ValueError(f"No logfile found at {inj_pattern}.")
-        elif len(log_paths) > 1:
-            warnings.warn(f"{len(log_paths)} directories matching the pattern have been found. Continuing with {log_paths[0]}")
-        inj_path = os.path.dirname(log_paths[0])
+        inj_pattern = os.path.join(obs_path_pattern, sbid, 'scans/', scan, scantime, run, clustering_dir, f'candidates.b{beam}.*rawcat.csv')
+        rawcat_paths = glob(inj_pattern)
+        if len(rawcat_paths) == 0:
+            raise ValueError(f"No raw catalog found at {inj_pattern}.")
+        elif len(rawcat_paths) > 1:
+            warnings.warn(f"{len(rawcat_paths)} directories matching the pattern have been found. Continuing with {rawcat_paths[0]}")
+        self.raw_cand_file = rawcat_paths[0]
+        clustering_path = os.path.dirname(rawcat_paths[0])
+        inj_path = os.path.dirname(clustering_path)
 
         # Get all the useful paths
         self.sbid = sbid
         self.beam = beam
         self.tsamp = tsamp
         self.run_path = inj_path
-        self.log_path = log_paths[0]
+        self.log_path = os.path.join(inj_path, f'search_pipeline_b{beam}.log')
         self.log_file = log_file
-        clustering_path = os.path.join(inj_path, clustering_dir)
         self.clustering_path = clustering_path
         self.orig_inj_path = path_if_exists(os.path.join(clustering_path, f'candidates.b{beam}.txt.inject.orig.csv'))
         self.found_inj_path = path_if_exists(os.path.join(clustering_path, f'candidates.b{beam}.txt.inject.cand.csv'))
-        self.raw_cand_file = path_if_exists(os.path.join(clustering_path, f'candidates.b{beam}.txt.rawcat.csv'))
-        self.uniq_path = path_if_exists(os.path.join(clustering_path, f'candidates.b{beam}.txt.uniq.csv'))
-        self.rfi_path = path_if_exists(os.path.join(clustering_path, f'candidates.b{beam}.txt.rfi.csv'))
-        self.crossmatch_path = path_if_exists(os.path.join(clustering_path, f'candidates.b{beam}.txt.catalog_cross_match.i1.csv'))
-        self.alias_path = path_if_exists(os.path.join(clustering_path, f'candidates.b{beam}.txt.alias_filter.i2.csv'))
+        # self.raw_cand_file = path_if_exists(os.path.join(clustering_path, f'candidates.b{beam}.rawcat.csv'))
+        self.uniq_path = path_if_exists(os.path.join(clustering_path, f'candidates.b{beam}.uniq.csv'))
+        self.rfi_path = path_if_exists(os.path.join(clustering_path, f'candidates.b{beam}.rfi.csv'))
+        # self.crossmatch_path = path_if_exists(os.path.join(clustering_path, f'candidates.b{beam}.txt.catalog_cross_match.i1.csv'))
+        # self.alias_path = path_if_exists(os.path.join(clustering_path, f'candidates.b{beam}.txt.alias_filter.i2.csv'))
         self.pcb_path = path_if_exists(os.path.join(inj_path, f'pcb{beam}.fil'))
         self.uvfits_path = path_if_exists(os.path.join(os.path.dirname(inj_path), f'b{beam}.uvfits'))
+
+        # Check path with ".txt" of older pipeline versions for backwards compatibility.
+        # if self.raw_cand_file is None:
+        #     self.raw_cand_file = path_if_exists(os.path.join(clustering_path, f'candidates.b{beam}.txt.rawcat.csv'))
+        if self.uniq_path is None:
+            self.uniq_path = path_if_exists(os.path.join(clustering_path, f'candidates.b{beam}.txt.uniq.csv'))
+        if self.rfi_path is None:
+            self.rfi_path = path_if_exists(os.path.join(clustering_path, f'candidates.b{beam}.txt.rfi.csv'))
 
     def calculate_dm_pccm3(self):
         """Calculate maximum searched DM."""
@@ -163,6 +172,10 @@ class InjectionResults:
         # injs = add_yaml_parameters(injs, self.yaml_path)  #"/CRACO/DATA_00/craco/injection/inj_params7_pc_width.yml") #
         injs = check_masked_channels(injs, filpath=self.pcb_path)
 
+        # Avoid error when no missed candidates are in any catalog.
+        if injs.loc[injs['missed'], 'snr'].isna().all():
+            injs.loc[injs['missed'], 'classification'] = None
+
         return injs
 
 
@@ -200,8 +213,7 @@ def check_candpipe_files(orig_file, found_file, obsi, print_missed=False, num_in
     orig_injs = pd.read_csv(orig_file)
 
     # Exclude candidates beyond the filelength.
-    v, _, _ = load_filterbank(obsi.pcb_path)
-    fil_length = v.shape[0]
+    fil_length = obsi.get_fil_length()
     in_obsi = orig_injs['total_sample_inj'] < fil_length
     orig_injs = orig_injs[in_obsi]
 
@@ -233,6 +245,8 @@ def check_candpipe_files(orig_file, found_file, obsi, print_missed=False, num_in
     #                                           'dm_pccm3':'dm_pccm3_inj'})
     missed_injs['missed'] = True
     found_injs['missed'] = False
+    missed_injs['classification'] = 'missed'
+    found_injs['classification'] = 'found'
 
     # Search uniq, rfi, and raw candidates for missed ones and save their properties. Exclude the raws that were found.
     if not missed_injs.empty:
@@ -340,21 +354,53 @@ def get_injection_results(sbid, run='inj', obs_path_pattern='/CRACO/DATA_??/crac
     inj_pattern = os.path.join(obs_path_pattern, sbid, scan_pattern, run)
 
     # Get beam numbers that were used in this observation (usually 00 to 35).
-    log_files = sorted(glob(os.path.join(inj_pattern, 'search_pipeline_b??.log')))
+    clustering_files = sorted(glob(os.path.join(inj_pattern, clustering_dir, 'candidates.b??.*rawcat.csv')))
 
     collated_data = []
 
-    for file in log_files:
+    for file in clustering_files:
         scan = file[file.find('scans/')+6 : file.find('scans/') + 8]
         scantime = file[file.find('scans/')+9 : file.find('scans/') + 23]
-        beam = file[file.find('pipeline_b')+10 : file.find('pipeline_b') + 12]
+        beam = file[file.find('candidates.b')+12 : file.find('candidates.b') + 14]
 
         obsi = InjectionResults(sbid, beam, scan=scan, run=run, scantime=scantime, clustering_dir=clustering_dir,
                                 log_file=log_file)
         try:
             collated_data.append(obsi.do_all_checks())
-        except ValueError:
-            print(f"{sbid}, {beam}, {scan}, {run}, {scantime}, {clustering_dir}, {log_file}")
+        except ValueError as err:
+            print(err)
+            print(f"{sbid}, {beam}, {scan}, {run}, {scantime}, {clustering_dir}, {obsi.found_inj_path}")
+
+    # Pick only the highest SNR candidates from every injection, but prefer non-RFI ones. Moved here for multi scan obsis.
+    snr_discard = 9
+    for i, sfd in enumerate(collated_data):  # "single file data"
+        inj_group = sfd.groupby('INJ_name', sort=False)
+        highest_snr = ((inj_group['snr'].transform('max') == sfd['snr'])
+                        | sfd['snr'].isna())  # the or is for Missed cands without detection, i.e. nans
+        # Apply throws an error in rare cases (beam 35 of 64401), maybe because the first group consists of several rows.
+        try:
+            selected_candidates = inj_group.apply(lambda g: select_candidate(g, snr_discard))
+            selected_candidates = selected_candidates.explode().astype(bool).to_numpy()
+        except (AttributeError, TypeError):
+            # Do the same with a loop.
+            selected_candidates = []
+            for g in inj_group:
+                sc = select_candidate(g[1], snr_discard)
+                if isinstance(sc, pd.Series):
+                    selected_candidates += sc.to_list()
+                else:
+                    selected_candidates.append(sc)
+            selected_candidates = np.array(selected_candidates)
+
+        print(f"{(~selected_candidates).sum()} injections were side clusters.", file=log_file)
+        n_groups_eq_sel_cands = inj_group.ngroups == selected_candidates.sum()
+        multiple_cands_per_group = np.any(sfd[selected_candidates].groupby('INJ_name')['snr'].count() != 1)
+        if not n_groups_eq_sel_cands or multiple_cands_per_group:
+            print("Problem with the candidate selection.", file=log_file)
+        sfd_sel = sfd[selected_candidates].copy()
+        sfd_sel["also_in_rfi"] = (selected_candidates & ~highest_snr)[selected_candidates]
+        collated_data[i] = sfd_sel
+
 
     collated_data = pd.concat(collated_data)
 
@@ -435,7 +481,9 @@ def list_to_str(int_list):
 
 def test_closest_inj(injs):
     if not np.all((injs['INJ_closest'] == injs['INJ_name']) | injs['INJ_closest'].isna()):
-        warnings.warn(f"Found injection is not the closest in time:\n{injs[(injs['INJ_closest'] == injs['INJ_name']) | injs['INJ_closest'].isna()]}")
+        warnings.warn("Found injection is not the closest in time:"
+            f"{injs[(injs['INJ_closest'] != injs['INJ_name']) & ~injs['INJ_closest'].isna()]}")
+        # only na when found in uniq or rfi
 
 
 def test_id_presence(obsi):
@@ -483,7 +531,7 @@ def select_candidate(group, snr_discard=9):
     return primary_cand
 
 
-def beam_model(lmpix, eta=0.9, phi=0.6, lpix0=128, mpix0=128):
+def beam_model(lmpix, eta=0.9, phi=0.6, lpix0=127.5, mpix0=127.5):
     """Loss in SNR due to efficiency and pixelization.
 
     lpix, mpix (int, float, or array): Pixel position
@@ -530,38 +578,26 @@ def collate_observation_data(sbid, run='inj', clustering_dir='clustering_output'
 
     # Drop some unused columns.
     collated_data = collated_data.drop(columns=['time', 'iblk', 'rawsn', 'obstime_sec', 'mjd', 'total_sample_middle', 'mSNR', 'mSlope',
-        'mSlopeSmooth', 'lpix_rms', 'mpix_rms', 'num_samps', 'centl', 'centm'])
-
-    # Get one of the beams.
-    obsi = InjectionResults(sbid, collated_data['beam'].iloc[0], run, clustering_dir=clustering_dir, log_file=log_file)
+        'mSlopeSmooth', 'num_samps'])  # vanished: 'lpix_rms', 'mpix_rms', , 'centl', 'centm'
 
     # Exclude injections at times where all channels are flagged.
     no_data = collated_data['masked'] == 0.
     print(f"{no_data.sum()} injections were outside the file or in a dropout.", file=log_file)
     collated_data = collated_data[~no_data]
 
-    # Exclude too high DMs
+    # Exclude too high DMs. Get yaml file from one of the beams.
+    obsi = InjectionResults(sbid, collated_data['beam'].iloc[0], run, clustering_dir=clustering_dir, log_file=log_file)
     obsi.yaml_path = path_if_exists(obsi.get_yaml_path())
     obsi.calculate_dm_pccm3()
     too_high_dm = collated_data['dm_pccm3_inj'] > obsi.dm_pccm3
     print(f"{too_high_dm.sum()} injections had a DM higher than the searched DM.", file=log_file)
     collated_data = collated_data[~too_high_dm]
 
-    # Pick only the highest SNR candidates from every injection, but prefer non-RFI ones.
-    snr_discard = 9
-    highest_snr = collated_data.groupby(['beam', 'INJ_name'])['snr'].transform('max') == collated_data['snr']
-    selected_candidates = collated_data.groupby(['beam', 'INJ_name'], sort=False).apply(lambda g: select_candidate(g, snr_discard))
-    selected_candidates = selected_candidates.explode().astype(bool).to_numpy()
-    print(f"{(~selected_candidates).sum()} injections were side clusters.", file=log_file)
-    n_groups_eq_sel_cands = collated_data.groupby(['beam', 'INJ_name'], sort=False).ngroups == selected_candidates.sum()
-    multiple_cands_per_group = np.any(collated_data[selected_candidates].groupby(['beam', 'INJ_name'])['snr'].count() != 1)
-    if not n_groups_eq_sel_cands or multiple_cands_per_group:
-        print("Problem with the candidate selection.", file=log_file)
-    collated_data = collated_data[selected_candidates]
-    collated_data["also_in_rfi"] = (selected_candidates & ~highest_snr)[selected_candidates]
-
     # See if it is marked as a known source.
-    collated_data['known_source'] = ~collated_data[['PSR_name', 'PSR_sep', 'RACS_name', 'RACS_sep', 'NEW_name', 'NEW_sep', 'ALIAS_name', 'ALIAS_sep']].isna().all(axis=1)
+    if 'MATCH_name' in collated_data.columns:
+        collated_data['known_source'] = ~collated_data['MATCH_name'].isna()
+    else:  # old source logic
+        collated_data['known_source'] = ~collated_data[['PSR_name', 'PSR_sep', 'RACS_name', 'RACS_sep', 'NEW_name', 'NEW_sep', 'ALIAS_name', 'ALIAS_sep']].isna().all(axis=1)
 
     collated_data = collated_data.sort_values(['beam', 'total_sample_inj']).reset_index()
 
@@ -596,6 +632,7 @@ def collate_observation_data(sbid, run='inj', clustering_dir='clustering_output'
 
     return collated_data, bestfit, uncert
 
+
 def report_outcomes(collated_data, log_file=None):
 
     beam_numbers = np.sort(collated_data['beam'].unique())
@@ -627,6 +664,7 @@ def report_outcomes(collated_data, log_file=None):
             f"7<SNR<=9: {less9}/{n_less9}\n"
             f"SNR>9: {great9}/{n_great9}\n",
             file=log_file)
+        collated_data[rfi & collated_data['snr'] > 9]
 
     # Known sources by SNR.
     known = collated_data['known_source']
@@ -672,4 +710,5 @@ def injspect(sbid, run='inj', clustering_dir='clustering_output', fig_path=None)
             clustering_dir=clustering_dir, log_file=log_file)
         to_save = report_outcomes(collated_data, log_file)
     pickle.dump([to_save, pixelfit, pixelfit_unc], open(os.path.join(fig_path, 'some_variables.pkl'), 'wb'))
+    collated_data.to_csv(os.path.join(fig_path, 'collated_data.csv'))
     make_all_pretty_plots(collated_data, pixelfit, pixelfit_unc, fig_path=fig_path, sbid=sbid, run=run)
