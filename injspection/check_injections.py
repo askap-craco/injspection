@@ -2,7 +2,6 @@ import os
 import warnings
 import numpy as np
 import pandas as pd
-import yaml
 import pickle
 
 from glob import glob
@@ -12,9 +11,8 @@ from importlib.metadata import version
 from craft import sigproc
 from craft import uvfits
 
-# import injspection
-
-from .create_injection_params_file import total_burst_length
+from .utils import sbid_str, path_if_exists, get_dm_pccm3, test_closest_inj, check_masked_channels, find_close_cands
+from .utils import add_missed_cols_etc, classification_to_bools, list_to_str
 from injspection.plot_results import make_all_pretty_plots
 
 
@@ -95,7 +93,8 @@ class InjectionResults:
         fil_length = self.get_fil_length()
         length_ratio = fil_length / fits_length
         if length_ratio < 0.9:
-            warnings.warn(f"The pcb file is only {length_ratio} of the uvfits file. Better check the log mate.")
+            print(f"Warning: The pcb file of beam {self.beam} is only {length_ratio} of the uvfits file. pcb: {fil_length}, "
+                  f"uvfits: {fits_length}. Better check the log mate.", file=self.log_path)
 
     def get_yaml_path(self, log_path=None):
         """Get the yaml file that has been used for injections from the log and some more log things."""
@@ -158,7 +157,7 @@ class InjectionResults:
 
     def do_all_checks(self):
         """Execute all functions."""
-        # self.compare_uvfits_fil_lengths()
+        self.compare_uvfits_fil_lengths()
         # test_id_presence(self)
         self.yaml_path = path_if_exists(self.get_yaml_path())
         log_injs = self.count_log_injections()
@@ -172,37 +171,7 @@ class InjectionResults:
         # injs = add_yaml_parameters(injs, self.yaml_path)  #"/CRACO/DATA_00/craco/injection/inj_params7_pc_width.yml") #
         injs = check_masked_channels(injs, filpath=self.pcb_path)
 
-        # Avoid error when no missed candidates are in any catalog.
-        if injs.loc[injs['missed'], 'snr'].isna().all():
-            injs.loc[injs['missed'], 'classification'] = None
-
         return injs
-
-
-def sbid_str(sbid):
-    """Convert the five digit SB number to SB0XXXXX."""
-    if len(str(sbid)) == 5:
-        sbid = 'SB0' + str(sbid)
-
-    return sbid
-
-
-def path_if_exists(path):
-    if not os.path.exists(path):
-        path = None
-    return path
-
-
-def get_dm_pccm3(freqs, dm_samps, tsamp):
-    '''Stolen from
-    freqs in Hz
-    tsamp in s
-    '''
-    delay_s = dm_samps * tsamp
-    fmax = np.max(freqs) * 1e-9
-    fmin = np.min(freqs) * 1e-9
-    dm_pccc = delay_s / 4.15 / 1e-3 / (1 / fmin**2 - 1 / fmax**2)
-    return dm_pccc
 
 
 def check_candpipe_files(orig_file, found_file, obsi, print_missed=False, num_injs=None, log_file=None):
@@ -216,6 +185,7 @@ def check_candpipe_files(orig_file, found_file, obsi, print_missed=False, num_in
     fil_length = obsi.get_fil_length()
     in_obsi = orig_injs['total_sample_inj'] < fil_length
     orig_injs = orig_injs[in_obsi]
+    print(f"Beam {obsi.beam}: PCB length {fil_length}, injections in length: {in_obsi.sum()}, outside:  {(~in_obsi).sum()}", file=log_file)
 
     if num_injs and len(orig_injs) > num_injs:
         print("Less bursts have been injected according to the log than planned!", file=log_file)
@@ -246,102 +216,73 @@ def check_candpipe_files(orig_file, found_file, obsi, print_missed=False, num_in
     missed_injs['missed'] = True
     found_injs['missed'] = False
     missed_injs['classification'] = 'missed'
-    found_injs['classification'] = 'found'
+    found_injs['classification'] = 'inj'
 
-    # Search uniq, rfi, and raw candidates for missed ones and save their properties. Exclude the raws that were found.
-    if not missed_injs.empty:
-        uniq_cands = pd.read_csv(obsi.uniq_path, index_col=0)
-        rfi_cands = pd.read_csv(obsi.rfi_path, index_col=0)
+    # See if found sources are marked as a known sources.
+    if 'MATCH_name' in found_injs.columns:
+        known_source = ~found_injs['MATCH_name'].isna()
+    else:  # old source logic
+        known_source = ~found_injs[['PSR_name', 'PSR_sep', 'RACS_name', 'RACS_sep', 'NEW_name', 'NEW_sep', 'ALIAS_name', 'ALIAS_sep']].isna().all(axis=1)
+    found_injs.loc[known_source, 'classification'] = 'known_source'
+
+    # Load catalogs.
+    # if not missed_injs.empty:
+    uniq_cands = pd.read_csv(obsi.uniq_path, index_col=0)
+    rfi_cands = pd.read_csv(obsi.rfi_path, index_col=0)
     raw_loaded = False
-    noninj_cands = []
+    uniq_and_rfi_cands = []
 
+    # Search for side clusters of known sources.
+    for mj in found_injs[known_source].index:
+        missed_inj = found_injs.loc[mj]
+        close_uniqs = find_close_cands(uniq_cands, missed_inj)
+        if not close_uniqs.empty:
+            uniq_and_rfi_cands.append(add_missed_cols_etc(close_uniqs, missed_inj, found_in='uniq'))
+        close_rfis = find_close_cands(rfi_cands, missed_inj)
+        if not close_rfis.empty:
+            uniq_and_rfi_cands.append(add_missed_cols_etc(close_rfis, missed_inj, found_in='rfi'))
+
+    # Search uniq, rfi, and raw candidates for missed ones and save their properties.
     for mj in missed_injs.index:
         missed_inj = missed_injs.loc[mj]
         close_uniqs = find_close_cands(uniq_cands, missed_inj)
         if not close_uniqs.empty:
-            noninj_cands.append(add_missed_cols_etc(close_uniqs, missed_inj, found_in='uniq'))
+            uniq_and_rfi_cands.append(add_missed_cols_etc(close_uniqs, missed_inj, found_in='uniq'))
 
-        close_rfis = find_close_cands(rfi_cands, missed_injs.loc[mj])
+        close_rfis = find_close_cands(rfi_cands, missed_inj)
         if not close_rfis.empty:
-            noninj_cands.append(add_missed_cols_etc(close_rfis, missed_inj, found_in='rfi'))
+            uniq_and_rfi_cands.append(add_missed_cols_etc(close_rfis, missed_inj, found_in='rfi'))
 
         if close_uniqs.empty and close_rfis.empty:
             if not raw_loaded:
                 raw_cands = pd.read_csv(obsi.raw_cand_file, index_col=0)
                 raw_cands = raw_cands[~raw_cands['cluster_id'].isin(found_injs['cluster_id'])]
+                raw_loaded = True
             close_raws = find_close_cands(raw_cands, missed_injs.loc[mj])
             if not close_raws.empty:
                 max_snr = close_raws['snr'].idxmax()
                 missed_injs.loc[mj, close_raws.columns] = close_raws.loc[max_snr]
                 missed_injs.loc[mj, 'n_clusters'] = len(close_raws['cluster_id'].unique())
-                missed_injs.loc[mj, 'found_in'] = 'raw'
-                missed_injs.loc[mj, 'classification'] = obsi.search_classification(close_raws.loc[max_snr, 'cluster_id'])
+                missed_injs.loc[mj, 'classification'] = 'raw'
+                missed_injs.loc[mj, 'raw_and'] = obsi.search_classification(close_raws.loc[max_snr, 'cluster_id'])
                 # Indexing with lists avoids conversion to Series. But doesn't work because index is different.
         else:
+            # Exclude the raws that were found.
             missed_injs = missed_injs.drop(index=mj)
 
-    injs = pd.concat([found_injs, missed_injs, *noninj_cands], ignore_index=True).sort_values('total_sample_inj').reset_index(drop=True)
+    injs = pd.concat([df for df in [found_injs, missed_injs, *uniq_and_rfi_cands] if not df.empty], ignore_index=True)
+    injs = injs.sort_values('total_sample_inj').reset_index(drop=True)
     injs['beam'] = obsi.beam_int
     injs['missed'] = injs['missed'].astype(bool)
 
-    return injs
-
-
-def add_missed_cols_etc(close_cands, missed_inj, found_in='unspec'):
-    """Add columns from missed_inj to the highest close cand"""
-    max_snr = close_cands['snr'].idxmax()
-    close_cands = close_cands.loc[max_snr:max_snr+1].copy()
-    close_cands['classification'] = found_in
-    missing_columns = [col for col in missed_inj.index if not pd.isna(col)]  # if col not in close_cands.columns
-    close_cands = close_cands.assign(**{col: missed_inj[col] for col in missing_columns})
-    return close_cands
-
-
-def count_found_clusters(found_injs, raw_cand_file):
-    """Count the clusters of found injections.
-
-    This has been outsourced cause it is time consuming (i.e. slow af).
-    """
-    raw_cands = pd.read_csv(raw_cand_file, index_col=0)
-    found_injs = found_injs.copy()  # Avoid setting on copy warnings.
-    for i in found_injs.index:
-        close_raws = find_close_cands(raw_cands, found_injs.loc[i])
-        if isinstance(close_raws['cluster_id'], np.number):
-            found_injs.loc[i, 'n_clusters'] = 1
-        else:
-            found_injs.loc[i, 'n_clusters'] = len(close_raws['cluster_id'].unique())
-
-    return found_injs
-
-
-def add_yaml_parameters(injs, yaml_path):
-    """Add some injected parameters that have not been saved by the classifier."""
-    yaml_path = yaml_path
-    blueprint = yaml.safe_load(open(yaml_path, 'r'))
-
-    bp_times = blueprint['injection_tsamps']
-    bp_sort_key = np.argsort(bp_times)
-    widths = np.array([blueprint['furby_props'][n]['width_samps'] for n in range(len(bp_times))])
-
-    injs = injs.sort_values('total_sample_inj')
-    widths_sorted = widths[bp_sort_key]
-    if len(widths) == len(injs):
-        injs['width_inj'] = widths_sorted
-    else:
-        for i, inj_name in enumerate(injs['total_sample_inj'].unique()):  # ugly but shouldn't happen often.
-            injs.loc[injs['total_sample_inj'] == inj_name, 'width_inj'] = widths_sorted[i]
-
-    return injs
-
-
-def check_masked_channels(injs, filpath):
-    """Check number of channels and data drops at burst locations."""
-    v, _, _ = load_filterbank(filpath)
-    fil_length = v.shape[0]
-    in_obsi = injs['total_sample_inj'] < fil_length
-    n_used_chans = np.sum(np.isfinite(v[injs.loc[in_obsi, 'total_sample_inj'].astype(int)]), axis=-1)
-    injs.loc[in_obsi, 'masked'] = n_used_chans / v.shape[-1]
-    injs.loc[~in_obsi, 'masked'] = 0.
+    # See again if any injection is marked as a known source.
+    if 'MATCH_name' in injs.columns:
+        known_source = ~injs['MATCH_name'].isna()
+    elif 'PSR_name' in injs.columns:  # old source logic
+        known_source = ~injs[['PSR_name', 'PSR_sep', 'RACS_name', 'RACS_sep', 'NEW_name', 'NEW_sep', 'ALIAS_name', 'ALIAS_sep']].isna().all(axis=1)
+    # else found_injs was empty
+    if np.any(known_source):
+        injs.loc[known_source, 'classification'] = 'known_source'
 
     return injs
 
@@ -373,165 +314,54 @@ def get_injection_results(sbid, run='inj', obs_path_pattern='/CRACO/DATA_??/crac
 
     # Pick only the highest SNR candidates from every injection, but prefer non-RFI ones. Moved here for multi scan obsis.
     snr_discard = 9
+    side_count = 0
     for i, sfd in enumerate(collated_data):  # "single file data"
         inj_group = sfd.groupby('INJ_name', sort=False)
         highest_snr = ((inj_group['snr'].transform('max') == sfd['snr'])
                         | sfd['snr'].isna())  # the or is for Missed cands without detection, i.e. nans
-        # Apply throws an error in rare cases (beam 35 of 64401), maybe because the first group consists of several rows.
-        try:
-            selected_candidates = inj_group.apply(lambda g: select_candidate(g, snr_discard))
-            selected_candidates = selected_candidates.explode().astype(bool).to_numpy()
-        except (AttributeError, TypeError):
-            # Do the same with a loop.
-            selected_candidates = []
-            for g in inj_group:
-                sc = select_candidate(g[1], snr_discard)
-                if isinstance(sc, pd.Series):
-                    selected_candidates += sc.to_list()
-                else:
-                    selected_candidates.append(sc)
-            selected_candidates = np.array(selected_candidates)
+        selected_candidates = highest_snr
+        # # Apply throws an error in rare cases (beam 35 of 64401), maybe because the first group consists of several rows.
+        # try:
+        #     selected_candidates = inj_group.apply(lambda g: select_candidate(g, snr_discard))
+        #     selected_candidates = selected_candidates.explode().astype(bool).to_numpy()
+        # except (AttributeError, TypeError):
+        #     # Do the same with a loop.
+        #     selected_candidates = []
+        #     for g in inj_group:
+        #         sc = select_candidate(g[1], snr_discard)
+        #         if isinstance(sc, pd.Series):
+        #             selected_candidates += sc.to_list()
+        #         else:
+        #             selected_candidates.append(sc)
+        #     selected_candidates = np.array(selected_candidates)
 
-        print(f"{(~selected_candidates).sum()} injections were side clusters.", file=log_file)
-        n_groups_eq_sel_cands = inj_group.ngroups == selected_candidates.sum()
-        multiple_cands_per_group = np.any(sfd[selected_candidates].groupby('INJ_name')['snr'].count() != 1)
-        if not n_groups_eq_sel_cands or multiple_cands_per_group:
-            print("Problem with the candidate selection.", file=log_file)
+        # Only keep highest SNR candidate. Check if it would have been found through a side cluster.
         sfd_sel = sfd[selected_candidates].copy()
-        sfd_sel["also_in_rfi"] = (selected_candidates & ~highest_snr)[selected_candidates]
+        sfd_sel['detected_in_side'] = False
+        any_in_inj_uniq = inj_group.apply(lambda g: np.any((g['snr'] > snr_discard)
+            & ((g['classification'] == 'inj') | (g['classification'] == 'uniq'))))
+        sfd_sel['detected_in_side'] = (any_in_inj_uniq & (sfd_sel['classification'] != 'inj')
+                                       & (sfd_sel['classification'] != 'uniq'))
+        # sfd_sel['also_in_rfi'] = (selected_candidates & ~highest_snr)[selected_candidates]
         collated_data[i] = sfd_sel
 
+        # Report and test for consistency.
+        side_count += (~selected_candidates).sum()
+        n_groups_eq_sel_cands = inj_group.ngroups == selected_candidates.sum()
+        cand_count = sfd_sel.groupby('INJ_name')['SNR_inj'].count()
+        multiple_cands_per_group = np.any(cand_count != 1)
+        if not n_groups_eq_sel_cands or multiple_cands_per_group:
+            print("Problem with the candidate selection.", file=log_file)
+            print(cand_count[cand_count != 1], file=log_file)
+
+    print(f"{side_count} injections were side clusters.", file=log_file)
 
     collated_data = pd.concat(collated_data)
 
     return collated_data
 
 
-def find_close_cands(raw_cands, inj, space_check=True):
-    if isinstance(inj, pd.DataFrame):
-        inj = inj.squeeze()  # Avoid error.
-
-    before, after = total_burst_length(inj['dm_pccm3_inj'], width=0, bonus=0)
-
-    close_in_time = ((raw_cands['total_sample'] > (inj['total_sample_inj'] - before))
-                     & (raw_cands['total_sample'] < (inj['total_sample_inj'] + before)))
-    raw_cands = raw_cands[close_in_time]
-
-    # close_in_dm = ((raw_cands['dm_pccm3'] > (inj['dm_pccm3_inj'] - dm_dist))
-    #                & (raw_cands['dm_pccm3'] < (inj['dm_pccm3_inj'] + dm_dist)))
-    if space_check:
-        close_in_space = np.sqrt((raw_cands['lpix']-inj['lpix_inj'])**2 + (raw_cands['mpix']-inj['mpix_inj'])**2) < 5
-        raw_cands = raw_cands[close_in_space]
-
-    return raw_cands
-
-
-def get_raw_cand_file(clustering_file):
-    """Get the file with raw candidates for a file from the clustering algorithms."""
-    path, file = os.path.split(clustering_file)
-
-    return os.path.join(path, file[:18] + '.rawcat.csv')
-
-# def analyze_filterbank(filpath, block_length=256):
-#     """Return the mean fraction of masked channels"""
-#     v, taxis, _ = load_filterbank(filpath)
-#     masked_blocks = np.isnan(v).reshape(v.shape[0]//block_length, block_length, v.shape[-2], v.shape[-1])
-#     masked_blocks = masked_blocks.all(1)
-
-#     masked_fraction = masked_blocks.sum(-1) / masked_blocks.shape[-1]
-
-#     return masked_fraction.mean, taxis.shape[0]
-
-
-def load_filterbank(filpath, tstart=0, ntimes=None):
-    if tstart < 0:
-        tstart = 0
-
-    # load files
-    f = sigproc.SigprocFile(filpath)
-    if ntimes:
-        nelements = ntimes*f.nifs*f.nchans
-    else:
-        nelements = -1  # loads the whole data set
-
-    f.seek_data(f.bytes_per_element*tstart)
-
-    if (f.nbits == 8): dtype = np.uint8
-    elif (f.nbits == 32): dtype = np.float32
-
-    v = np.fromfile(f.fin, dtype=dtype, count=nelements )
-    v = v.reshape(-1, f.nifs, f.nchans)
-
-    tend = tstart + v.shape[0]
-
-    ### give a list of time
-    taxis = np.linspace(tstart, tend, v.shape[0], endpoint=False)
-    faxis = np.arange(f.nchans) * f.foff + f.fch1
-
-    ### change 0 value to nan
-    v[v == 0.] = np.nan
-
-    return v, taxis, faxis
-
-
-def list_to_str(int_list):
-    """Convert list into a string with comma separated entries for printing."""
-    return ''.join([str(beam)+', ' for beam in sorted(int_list)])[:-2]
-
-
-def test_closest_inj(injs):
-    if not np.all((injs['INJ_closest'] == injs['INJ_name']) | injs['INJ_closest'].isna()):
-        warnings.warn("Found injection is not the closest in time:"
-            f"{injs[(injs['INJ_closest'] != injs['INJ_name']) & ~injs['INJ_closest'].isna()]}")
-        # only na when found in uniq or rfi
-
-
-def test_id_presence(obsi):
-    """Assert that every cluster is once and only once in the catalogs."""
-    # Only use candidate files that exist.
-    cand_files = [file for file in [obsi.rfi_path, obsi.found_inj_path, obsi.uniq_path] if file]
-    raws = pd.read_csv(obsi.raw_cand_file, index_col=0)[['cluster_id', 'spatial_id']]
-    cluster_ids = raws['cluster_id'].unique()
-    in_file = np.zeros((len(cand_files), len(cluster_ids)), dtype=int)
-    for i, file in enumerate(cand_files):
-        file_ids = pd.read_csv(file, index_col=0)['cluster_id'].astype(int).values
-        in_file[i] = np.sum(cluster_ids[:, None] == file_ids, axis=1)
-
-    presences = in_file.sum(axis=0)
-
-    # If a cluster is present in several files it must have different spatial IDs.
-    lone_cluster_ids = np.nonzero(presences > 1)[0]
-    lone = raws.loc[raws['cluster_id'].isin(lone_cluster_ids)]
-    n_spatial_clusters = lone.groupby('cluster_id')['spatial_id'].apply(lambda gdf: len(gdf.unique()))
-    problematic = n_spatial_clusters != presences[presences > 1]
-    if np.any(problematic):
-        print("Non-unique cluster ID detected. Number in Raw:")
-        print(n_spatial_clusters.loc[problematic])
-        print("Numbers in rfi, inj, uniq catalogs:")
-        print(in_file[:, presences > 1][:, problematic])
-    # assert not np.any(problematic)
-    # return np.all(problematic)
-
-
-def select_candidate(group, snr_discard=9):
-    """For Every group select one candidate to keep.
-
-    If there is non-RFI candidates take the one with maximum SNR of those,
-    otherwise just take the max SNR one.
-    """
-    if len(group) == 1:
-        primary_cand = True
-    else:
-        primary_cand = (group['snr'] > snr_discard) & (group['classification'] != 'rfi')
-        if primary_cand.any():
-            primary_cand &= group['snr'] == group.loc[primary_cand, 'snr'].max()
-        else:
-            primary_cand = group['snr'] == group['snr'].max()
-
-    return primary_cand
-
-
-def beam_model(lmpix, eta=0.9, phi=0.6, lpix0=127.5, mpix0=127.5):
+def beam_model(lmpix, eta=0.9, del_l=1., lpix0=127.5, mpix0=127.5):
     """Loss in SNR due to efficiency and pixelization.
 
     lpix, mpix (int, float, or array): Pixel position
@@ -540,9 +370,10 @@ def beam_model(lmpix, eta=0.9, phi=0.6, lpix0=127.5, mpix0=127.5):
     lpix0, mpix0 (int or float): Beam center.
     """
     lpix, mpix = lmpix[:, 0], lmpix[:, 1]
-    theta_l = np.pi*phi*(lpix-lpix0)/256
-    theta_m = np.pi*phi*(mpix-mpix0)/256
-    return eta*np.cos(np.sqrt(theta_l**2 + theta_m**2))
+    l = (lpix-lpix0)/256
+    m = (mpix-mpix0)/256
+    # Note that a factor pi is contained in numpys sinc, i.e. np.sinc(x)=sin(pi*x)/pi*x
+    return eta*np.sinc(del_l*l)*np.sinc(del_l*m)
 
 
 def fit_beams(data, fix_mpix0=False, fix_lpix0=False):
@@ -558,7 +389,7 @@ def fit_beams(data, fix_mpix0=False, fix_lpix0=False):
     beam_fit = []
     for beam in beams:
         beam_data = data[data['beam'] == beam]
-        pixels = beam_data[['lpix_inj', 'mpix_inj']].dropna().astype(np.float64).to_numpy()
+        pixels = beam_data[['lpix', 'mpix']].dropna().astype(np.float64).to_numpy()
         if fix_lpix0:
             # Swap columns such that mpix will be fitted
             pixels = pixels[:,::-1]
@@ -593,19 +424,13 @@ def collate_observation_data(sbid, run='inj', clustering_dir='clustering_output'
     print(f"{too_high_dm.sum()} injections had a DM higher than the searched DM.", file=log_file)
     collated_data = collated_data[~too_high_dm]
 
-    # See if it is marked as a known source.
-    if 'MATCH_name' in collated_data.columns:
-        collated_data['known_source'] = ~collated_data['MATCH_name'].isna()
-    else:  # old source logic
-        collated_data['known_source'] = ~collated_data[['PSR_name', 'PSR_sep', 'RACS_name', 'RACS_sep', 'NEW_name', 'NEW_sep', 'ALIAS_name', 'ALIAS_sep']].isna().all(axis=1)
-
     collated_data = collated_data.sort_values(['beam', 'total_sample_inj']).reset_index()
 
     collated_data['SNR/SNR_inj'] =  collated_data['snr'] / collated_data['SNR_inj'] / np.sqrt(collated_data['masked'])
 
     # Fit a beam model to the lpix, mpix data.
-    not_seen = collated_data['missed'] & collated_data['snr'].isna()
-    data = collated_data[~not_seen]
+    seen = collated_data['classification'] != 'missed'
+    data = collated_data[seen]
     multiple_lpix = not np.all(collated_data['lpix_inj'] == collated_data.loc[0, 'lpix_inj'])
     multiple_mpix = not np.all(collated_data['mpix_inj'] == collated_data.loc[0, 'mpix_inj'])
     if multiple_lpix and multiple_mpix:
@@ -621,9 +446,9 @@ def collate_observation_data(sbid, run='inj', clustering_dir='clustering_output'
         beams, bestfit, uncert = fit_beams(data, fix_mpix0=True)
 
     for i, beam in enumerate(beams):
-        lmpix = collated_data.loc[collated_data['beam'] == beam, ['lpix', 'mpix']].to_numpy()
+        lmpix = collated_data.loc[collated_data['beam'] == beam, ['lpix_inj', 'mpix_inj']].to_numpy()
         if multiple_mpix and not multiple_lpix:
-            # Swap columns such that mpix fit will be use for mpix
+            # Swap columns such that mpix fit will be used for mpix
             lmpix = lmpix[:,::-1]
         collated_data.loc[collated_data['beam'] == beam, 'recovery'] = beam_model(lmpix, *bestfit[i])
 
@@ -636,21 +461,28 @@ def collate_observation_data(sbid, run='inj', clustering_dir='clustering_output'
 def report_outcomes(collated_data, log_file=None):
 
     beam_numbers = np.sort(collated_data['beam'].unique())
-    all_found = beam_numbers[~collated_data.groupby('beam')['missed'].any()]
+    uniq, found, missed, rfi, known, raw, side, would_missed = classification_to_bools(collated_data)
+
+    if np.all(found ^ missed ^ rfi ^ known ^ raw ^ side):
+        print("Classifications are consistent.", file=log_file)
+    else:
+        print("Problem with classification.", file=log_file)
+
+    all_found = beam_numbers[collated_data.groupby('beam').apply(lambda g: (g['classification'] == 'uniq')
+        | (g['classification'] == 'inj')).all()]
 
     # Print which beams missed detections.
     print(f"{len(all_found)} beams had no missed injections. These are beams {list_to_str(all_found)}.", file=log_file)
 
-    beams_missed_injs = collated_data.loc[collated_data['missed'], 'beam'].to_list()
-    print(f"{len(beams_missed_injs)} injections have been missed. These are in beams "
-          f"{list_to_str(beams_missed_injs)}.", file=log_file)
-    print(f"{collated_data['known_source'].sum()} injections have been marked as known sources.", file=log_file)
+    # Uniques that would have triggered online, not including side clusters.
+    print(f"Classified as unique: {np.sum(uniq)}", file=log_file)
 
-    # Check misclassified classification.
-    misclassified = collated_data['missed'] & (~collated_data['snr'].isna())
+    # beams_missed_injs = collated_data.loc[collated_data['missed'], 'beam'].to_list()
+    print(f"{np.sum(missed)} injections have been missed.", file=log_file) #len(beams_missed_injs) These are in beams "
+        #   f"{list_to_str(beams_missed_injs)}."
+    print(f"{np.sum(known)} injections have been marked as known sources.", file=log_file)
 
     # Missed statistics based on SNR.
-    rfi = (misclassified & (collated_data['classification'] == 'rfi'))
     print("Classified as RFI:\n"
         fr"total: {rfi.sum()}/{collated_data.shape[0]}", file=log_file)
     if rfi.any():
@@ -667,7 +499,6 @@ def report_outcomes(collated_data, log_file=None):
         collated_data[rfi & collated_data['snr'] > 9]
 
     # Known sources by SNR.
-    known = collated_data['known_source']
     print(fr"Classified as a known source:", file=log_file)
     print(fr"total: {known.sum()}/{collated_data.shape[0]}", file=log_file)
     if known.any():
@@ -682,17 +513,34 @@ def report_outcomes(collated_data, log_file=None):
             f"SNR>9: {great9}/{n_great9}",
             file=log_file)
 
-    # Percent classified missed
-    missed = collated_data['snr'].isna() | rfi | collated_data['known_source']
-    print(f"Total missed: {np.sum(missed)}/{collated_data.shape[0]} = "
-          f"{np.sum(missed)/collated_data.shape[0] * 100:.2f} %",
+    # Only found in the raw candidates.
+    print(f"Only found in the raw candidates: {raw.sum()}", file=log_file)
+
+    # Recovered through side clusters.
+    print(f"Recovered through side clusters: {side.sum()}", file=log_file)
+
+    # Percent classified missed.
+    print(f"Total missed: {np.sum(would_missed)}/{collated_data.shape[0]} = "
+          f"{np.sum(would_missed)/collated_data.shape[0] * 100:.2f} %",
           file=log_file)
+    # Would missed that are expected to be detected.
+    should_detect = collated_data['SNR_expected'] > 9
+    print(f"Total missed with SNR_expected > 9: {np.sum(should_detect & would_missed)}/{should_detect.sum()} = "
+          f"{np.sum(should_detect & would_missed)/should_detect.sum() * 100:.2f} %",
+          file=log_file)
+
 
     # Save some numbers to disk.
     to_save = {'total' : len(collated_data),
+               'found' : found.sum(),
+               'uniq' : uniq.sum(),
                'missed' : missed.sum(),
                'rfi' : rfi.sum(),
                'known' : known.sum(),
+               'raw' : raw.sum(),
+               'side' : side.sum(),
+               'wouldmissed>9' : np.sum(should_detect & would_missed),
+               'should_detect' : should_detect.sum()
                }
 
     return to_save

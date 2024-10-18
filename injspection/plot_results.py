@@ -4,6 +4,8 @@ import matplotlib.pyplot as plt
 
 from scipy.optimize import curve_fit
 
+from .utils import classification_to_bools
+
 # Change some defaults plot parameters (sneaky).
 TEXTWIDTH = 7.0282
 COLUMNWIDTH = 3.37574803
@@ -93,42 +95,43 @@ def plot_var_in_all_beams(selected_data, x_var):
         data = selected_data[selected_data['beam'] == beam]
 
         # Make a few masks for different happenings.
-        found = ~data['missed'] & ~data['known_source']
-        too_low_snr = (~data['missed']) & (data['snr'] < snr_low_limit)
-        misclassified = data['missed'] & (~data['snr'].isna())
-        not_seen = data['missed'] & data['snr'].isna()
-        misattributed = data['known_source']
-        uniq_mc = (data.loc[misclassified, 'classification'] == 'uniq') & ~data.loc[misclassified, 'also_in_rfi']
-        side_of_rfi = (data.loc[misclassified, 'classification'] == 'uniq') & data.loc[misclassified, 'also_in_rfi']
+        uniq, found, missed, rfi, known, raw, side, would_missed = classification_to_bools(data)
+        too_low_snr = found & (data['snr'] < snr_low_limit)
+        # found = ~data['missed'] & ~data['known_source']
+        # too_low_snr = (~data['missed']) & (data['snr'] < snr_low_limit)
+        # misclassified = data['missed'] & (~data['snr'].isna())
+        # not_seen = data['missed'] & data['snr'].isna()
+        # misattributed = data['known_source']
+        # uniq_mc = data.loc[misclassified, 'classification'] == 'uniq' #& ~data.loc[misclassified, 'also_in_rfi']
+        # rfi_mc = data.loc[misclassified, 'classification'] == 'rfi'
+        # side_of_rfi = data.loc[misclassified, 'classification'] == 'uniq' #& data.loc[misclassified, 'also_in_rfi']
 
         ax = axs[row, col]
         ax.plot(data.loc[found, x_var], data.loc[found, 'SNR/SNR_inj'], '.', label=f"{len(data)} total")
         if too_low_snr.any():
             ax.plot(data.loc[too_low_snr, x_var], data.loc[too_low_snr, 'SNR/SNR_inj'], '.', color='purple',
                     label=f"{np.sum(too_low_snr)} SNR < {snr_low_limit}")
-        if misclassified.any():
-            if (~uniq_mc).any():
-                ax.plot(data[misclassified].loc[~uniq_mc, x_var], data[misclassified].loc[~uniq_mc, 'SNR/SNR_inj'],
-                        '.', color='red', label=f"{np.sum(~uniq_mc)} RFI")
-            if uniq_mc.any():
-                ax.plot(data[misclassified].loc[uniq_mc, x_var], data[misclassified].loc[uniq_mc, 'SNR/SNR_inj'],
-                        '.', color='orange', label=f"{np.sum(uniq_mc)} in uniq")
-            if side_of_rfi.any():
-                ax.plot(data[misclassified].loc[side_of_rfi, x_var],
-                        data[misclassified].loc[side_of_rfi, 'SNR/SNR_inj'],
-                        '.', color='darkorange', label=f"{np.sum(side_of_rfi)} sidecluster")
-        if misattributed.any():
-            ax.plot(data.loc[misattributed, x_var], data.loc[misattributed, 'SNR/SNR_inj'], '.', color='magenta',
-                    label=f"{np.sum(misattributed)} psr etc.")
-        if not_seen.any():
-            ax.plot(data.loc[not_seen, x_var], 6/data.loc[not_seen, 'SNR_inj'], 'v', color='r',
-                    label=f"{np.sum(not_seen)} missed")
+        if rfi.any():
+            ax.plot(data.loc[rfi, x_var], data.loc[rfi, 'SNR/SNR_inj'],
+                    '.', color='red', label=f"{np.sum(rfi)} RFI")
+        if uniq.any():
+            ax.plot(data.loc[uniq, x_var], data.loc[uniq, 'SNR/SNR_inj'],
+                    '.', color='orange', label=f"{np.sum(uniq)} in uniq")
+        if side.any():
+            ax.plot(data.loc[side, x_var], data.loc[side, 'SNR/SNR_inj'],
+                    '.', color='darkorange', label=f"{np.sum(side)} sidecluster")
+        if known.any():
+            ax.plot(data.loc[known, x_var], data.loc[known, 'SNR/SNR_inj'], '.', color='magenta',
+                    label=f"{np.sum(known)} psr etc.")
+        if missed.any():
+            ax.plot(data.loc[missed, x_var], 6/data.loc[missed, 'SNR_inj'], 'v', color='r',
+                    label=f"{np.sum(missed)} missed")
         if plot_mean:
             ax.plot(data.groupby(x_var)[x_var].first(), data.groupby(x_var)['SNR/SNR_inj'].mean(), color='black')
         if x_var == "lpix":
             func = lambda x, A, w, phi=127: A*np.cos(np.pi*w*(x-phi)/256)
-            x_data = data.loc[~not_seen, x_var].dropna().astype(float)
-            y_data = data.loc[~not_seen, 'SNR/SNR_inj'].dropna().astype(float)
+            x_data = data.loc[~missed, x_var].dropna().astype(float)
+            y_data = data.loc[~missed, 'SNR/SNR_inj'].dropna().astype(float)
             fit = curve_fit(func, x_data, y_data, p0=[1, 1, 127])
             ax.plot(x_data, func(x_data, *fit[0]), c='black')
             beam_fit.append(fit)
@@ -148,23 +151,25 @@ def plot_var_in_all_beams(selected_data, x_var):
 
 
 def plot_efficiency(data, snr='SNR_inj', snr_low_limit=9, ms=3):
-    fig, axs = plt.subplots(3, 3, tight_layout=True, figsize=(TEXTWIDTH, TEXTWIDTH), sharey=True,
+    fig, axs = plt.subplots(3, 4, tight_layout=True, figsize=(1.3*TEXTWIDTH, TEXTWIDTH), sharey=True,
                             gridspec_kw={'wspace': 0.0, 'hspace':0.3})
     #sharex=True ,, 'wspace':0.01
 
     # Make a few masks for different happenings.
-    found = ~data['missed'] & ~data['known_source']
-    too_low_snr = (~data['missed']) & (data['snr'] < snr_low_limit)
-    misclassified = data['missed'] & (~data['snr'].isna())
-    not_seen = data['missed'] & data['snr'].isna()
-    misattributed = data['known_source']
-    uniq_mc = data.loc[misclassified, 'classification'] == 'uniq'
+    uniq, found, missed, rfi, known, raw, side, would_missed = classification_to_bools(data)
+    too_low_snr = found & (data['snr'] < snr_low_limit)
+
+    # Calculate an angle and radius in the lpix, mpix space to plot against
+    l = (data['lpix']-127.5)
+    m = (data['mpix']-127.5)
+    data['rpix'] = np.sqrt(l**2 + m**2)
+    data['phipix'] = np.arctan2(m, l)
 
     x_vars = [snr, 'width_samps_inj', 'subsample_phase_inj', 'lpix', 'mpix', 'dm_pccm3_inj', 'beam',
-              'total_sample_inj']
+              'total_sample_inj', 'rpix', 'phipix']
     xlabels = [snr, r"Width (samples)", "Subsample phase",
                "lpix", "mpix", r"DM (pc cm$^3$)",
-               "Beam", "Time (samples)"]
+               "Beam", "Time (samples)", "Radius in lpix-mpix", "Angle in lpix-mpix"]
 
     # Take the mean of the efficiency over different beams.
     agg_dict = {x_var : 'first' for x_var in x_vars}
@@ -173,25 +178,26 @@ def plot_efficiency(data, snr='SNR_inj', snr_low_limit=9, ms=3):
 
     for ax, x_var, xlabel in zip(axs.flatten(), x_vars, xlabels):
         if found.any():
-            ax.plot(data.loc[found, x_var], data.loc[found, 'SNR/'+snr], '.', ms=ms, alpha=0.3,
+            ax.plot(data.loc[found, x_var], data.loc[found, 'SNR/'+snr], '.', color='grey', ms=ms, alpha=0.3,
                     label=f"{len(data)} total")  #np.sum(found)
         if too_low_snr.any():
-            ax.plot(data.loc[too_low_snr, x_var], data.loc[too_low_snr, 'SNR/'+snr], '.', color='purple', ms=ms,
+            ax.plot(data.loc[too_low_snr, x_var], data.loc[too_low_snr, 'SNR/'+snr], '.', color='blue', ms=ms,
                     alpha=0.3, label=f"{np.sum(too_low_snr)} SNR < {snr_low_limit}")
         if not x_var == 'beam':
             x_var_sorted = eff_mean[x_var].sort_values()
             ax.plot(x_var_sorted, eff_mean.loc[x_var_sorted.index, 'SNR/'+snr], color='k', lw=1, label="Beam average")
-        if misclassified.any():
-            ax.plot(data[misclassified].loc[uniq_mc, x_var], data[misclassified].loc[uniq_mc, 'SNR/'+snr], '.',
-                    color='orange', ms=ms, alpha=0.3, label=f"{np.sum(uniq_mc)} in uniq")
-            ax.plot(data[misclassified].loc[~uniq_mc, x_var], data[misclassified].loc[~uniq_mc, 'SNR/'+snr], '.',
-                    color='red', ms=ms, label=f"{np.sum(~uniq_mc)} RFI")
-        if misattributed.any():
-            ax.plot(data.loc[misattributed, x_var], data.loc[misattributed, 'SNR/'+snr], '.', color='magenta', ms=ms,
-                    label=f"{np.sum(misattributed)} psr etc.")
-        if not_seen.any():
-            ax.plot(data.loc[not_seen, x_var], 6/data.loc[not_seen, snr], 'v', color='r', ms=0.5*ms,
-                    label=f"{np.sum(not_seen)} missed")
+        if rfi.any():
+            ax.plot(data.loc[rfi, x_var], data.loc[rfi, 'SNR/'+snr], '.',
+                    color='orange', ms=ms, label=f"{np.sum(rfi)} RFI")
+        if known.any():
+            ax.plot(data.loc[known, x_var], data.loc[known, 'SNR/'+snr], '.', color='purple', ms=ms,
+                    label=f"{np.sum(known)} psr etc.")
+        if missed.any():
+            ax.plot(data.loc[missed, x_var], 6/data.loc[missed, snr], 'v', color='r', ms=0.5*ms,
+                    label=f"{np.sum(missed)} completely missed")
+        if side.any():
+            ax.plot(data.loc[side, x_var], data.loc[side, 'SNR/'+snr], '.', color='blue', ms=ms,
+                    alpha=0.3, label=f"{np.sum(side)} rescued in side")
 
         ax.set_xlabel(xlabel)
 
@@ -232,6 +238,8 @@ def plot_beamfitting(bestfit, uncert):
 
 def make_all_pretty_plots(collated_data, pixelfit=None, pixelfit_unc=None, fig_path="", sbid="", run=""):
     """Make the various plots from this module to analyse the injections."""
+    plt.rcParams['savefig.dpi'] = 300
+
     x_var = "SNR_inj"
     fig, axs = plot_var_in_all_beams(collated_data, x_var=x_var)
     if fig_path:
